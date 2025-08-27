@@ -54,23 +54,55 @@ describe('Store Deletion Tests', () => {
       callback(null, {});
     });
 
+    AWS.mock('DynamoDB.DocumentClient', 'put', (params, callback) => {
+      // Mock storing confirmation codes
+      callback(null, {});
+    });
+
+    AWS.mock('DynamoDB.DocumentClient', 'get', (params, callback) => {
+      // Mock retrieving confirmation codes
+      if (params.Key && params.Key.sk && params.Key.sk.includes('CONFIRMATION#')) {
+        callback(null, {
+          Item: {
+            pk: params.Key.pk,
+            sk: params.Key.sk,
+            confirmationCode: '123456',
+            ttl: Math.floor(Date.now() / 1000) + 900, // 15 minutes from now
+            userId: 'test-user-123',
+            storeId: 'store123'
+          }
+        });
+      } else {
+        callback(null, {});
+      }
+    });
+
     AWS.mock('DynamoDB.DocumentClient', 'query', (params, callback) => {
-      if (params.KeyConditionExpression.includes('begins_with(sk, :skPrefix)')) {
+      if (params.KeyConditionExpression && params.KeyConditionExpression.includes('begins_with(sk, :skPrefix)')) {
         // Return associated data for cascade delete
         const prefix = params.ExpressionAttributeValues[':skPrefix'];
         if (prefix === 'PRODUCT#') {
           callback(null, { Items: [
-            { pk: 'USER#test-user', sk: 'PRODUCT#store123#prod1' },
-            { pk: 'USER#test-user', sk: 'PRODUCT#store123#prod2' }
+            { pk: 'USER#test-user-123', sk: 'PRODUCT#store123#prod1' },
+            { pk: 'USER#test-user-123', sk: 'PRODUCT#store123#prod2' }
           ]});
         } else if (prefix === 'ORDER#') {
           callback(null, { Items: [
-            { pk: 'USER#test-user', sk: 'ORDER#store123#order1' }
+            { pk: 'USER#test-user-123', sk: 'ORDER#store123#order1' }
           ]});
         } else if (prefix === 'INVENTORY#') {
           callback(null, { Items: [
-            { pk: 'USER#test-user', sk: 'INVENTORY#store123#inv1' }
+            { pk: 'USER#test-user-123', sk: 'INVENTORY#store123#inv1' }
           ]});
+        } else if (prefix === 'STORE#') {
+          // Return store for fetching
+          callback(null, { Items: [{
+            pk: 'USER#test-user-123',
+            sk: 'STORE#store123_metadata',
+            storeId: 'store123',
+            storeName: 'Test Store',
+            type: 'shopify'
+          }]});
         } else {
           callback(null, { Items: [] });
         }
@@ -92,6 +124,15 @@ describe('Store Deletion Tests', () => {
 
     AWS.mock('SES', 'sendEmail', (params, callback) => {
       callback(null, { MessageId: 'test-message-id' });
+    });
+
+    AWS.mock('SecretsManager', 'getSecretValue', (params, callback) => {
+      callback(null, { 
+        SecretString: JSON.stringify({ 
+          SHOPIFY_CLIENT_ID: 'test-client-id',
+          SHOPIFY_CLIENT_SECRET: 'test-secret'
+        })
+      });
     });
 
     // Clear require cache and re-require handler

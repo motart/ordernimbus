@@ -1,10 +1,11 @@
 const { expect } = require('chai');
 const sinon = require('sinon');
-const AWS = require('aws-sdk-mock');
+const proxyquire = require('proxyquire');
 
 describe('Store Fetching Tests', () => {
   let handler;
-  let dynamodbMock;
+  let dynamodbStub;
+  let secretsManagerStub;
 
   beforeEach(() => {
     // Set up environment variables
@@ -12,11 +13,28 @@ describe('Store Fetching Tests', () => {
     process.env.AWS_REGION = 'us-west-1';
     process.env.NODE_ENV = 'test';
 
-    // Mock AWS SDK BEFORE requiring the handler
-    AWS.mock('DynamoDB.DocumentClient', 'query', (params, callback) => {
-      // Return a store with the new format sk: STORE#storeId_metadata
-      if (params.ExpressionAttributeValues[':skPrefix'] === 'STORE#') {
-        callback(null, {
+    // Create stubs for AWS services
+    const queryStub = sinon.stub();
+    const getSecretValueStub = sinon.stub();
+    
+    dynamodbStub = {
+      query: () => ({ promise: queryStub }),
+      put: () => ({ promise: sinon.stub().resolves({}) }),
+      get: () => ({ promise: sinon.stub().resolves({}) }),
+      delete: () => ({ promise: sinon.stub().resolves({}) }),
+      batchWrite: () => ({ promise: sinon.stub().resolves({}) })
+    };
+
+    secretsManagerStub = {
+      getSecretValue: () => ({ promise: getSecretValueStub })
+    };
+
+    // Setup query responses
+    queryStub.callsFake(() => {
+      console.log('queryStub called with arguments:', arguments[0]);
+      const params = arguments[0];
+      if (params && params.ExpressionAttributeValues && params.ExpressionAttributeValues[':skPrefix'] === 'STORE#') {
+        return Promise.resolve({
           Items: [{
             pk: 'USER#test-user-123',
             sk: 'STORE#shopify_1756328647971_vfgenaydy_metadata',
@@ -31,27 +49,32 @@ describe('Store Fetching Tests', () => {
             createdAt: '2025-08-27T21:04:07.971Z'
           }]
         });
-      } else {
-        callback(null, { Items: [] });
+      }
+      return Promise.resolve({ Items: [] });
+    });
+
+    getSecretValueStub.resolves({
+      SecretString: JSON.stringify({ 
+        SHOPIFY_CLIENT_ID: 'test-client-id',
+        SHOPIFY_CLIENT_SECRET: 'test-secret'
+      })
+    });
+
+    // Use proxyquire to inject mocked AWS SDK
+    handler = proxyquire('../../lambda/production/index.js', {
+      'aws-sdk': {
+        DynamoDB: {
+          DocumentClient: sinon.stub().returns(dynamodbStub)
+        },
+        SecretsManager: sinon.stub().returns(secretsManagerStub),
+        SES: sinon.stub().returns({
+          sendEmail: () => ({ promise: sinon.stub().resolves({}) })
+        })
       }
     });
-
-    AWS.mock('SecretsManager', 'getSecretValue', (params, callback) => {
-      callback(null, { 
-        SecretString: JSON.stringify({ 
-          SHOPIFY_CLIENT_ID: 'test-client-id',
-          SHOPIFY_CLIENT_SECRET: 'test-secret'
-        })
-      });
-    });
-
-    // Clear require cache and re-require handler AFTER mocks are set
-    delete require.cache[require.resolve('../../lambda/production/index.js')];
-    handler = require('../../lambda/production/index.js');
   });
 
   afterEach(() => {
-    AWS.restore();
     sinon.restore();
   });
 
@@ -81,10 +104,11 @@ describe('Store Fetching Tests', () => {
   });
 
   it('should handle stores with underscore in storeId correctly', async () => {
-    AWS.restore('DynamoDB.DocumentClient');
-    AWS.mock('DynamoDB.DocumentClient', 'query', (params, callback) => {
-      if (params.ExpressionAttributeValues[':skPrefix'] === 'STORE#') {
-        callback(null, {
+    // Update the stub to return a different store
+    const queryStub = sinon.stub();
+    queryStub.callsFake((params) => {
+      if (params && params.ExpressionAttributeValues && params.ExpressionAttributeValues[':skPrefix'] === 'STORE#') {
+        return Promise.resolve({
           Items: [{
             pk: 'USER#test-user-123',
             sk: 'STORE#manual_store_123_abc_metadata',
@@ -94,10 +118,12 @@ describe('Store Fetching Tests', () => {
             type: 'brick-and-mortar'
           }]
         });
-      } else {
-        callback(null, { Items: [] });
       }
+      return Promise.resolve({ Items: [] });
     });
+    
+    // Replace the query method for this test
+    dynamodbStub.query = () => ({ promise: queryStub });
 
     const event = {
       rawPath: '/production/api/stores',
