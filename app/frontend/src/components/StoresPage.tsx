@@ -85,6 +85,10 @@ const StoresPage: React.FC = () => {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [storeToDelete, setStoreToDelete] = useState<Store | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [confirmationCode, setConfirmationCode] = useState('');
+  const [isRequestingCode, setIsRequestingCode] = useState(false);
+  const [codeRequested, setCodeRequested] = useState(false);
+  const [codeExpiresAt, setCodeExpiresAt] = useState<Date | null>(null);
   const [showCSVUpload, setShowCSVUpload] = useState(false);
   const [selectedStoreForCSV, setSelectedStoreForCSV] = useState<Store | null>(null);
   const [newStoreIds, setNewStoreIds] = useState<Set<string>>(new Set()); // Track newly added stores
