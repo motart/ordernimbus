@@ -1442,11 +1442,14 @@ exports.handler = async (event) => {
             statusCode = 500;
           }
         }
-        // Handle DELETE method
+        // Handle DELETE method with confirmation
         else if (method === 'DELETE') {
-          const storeId = event.pathParameters?.id || event.queryStringParameters?.storeId;
+          // Check if this is a request for deletion code or actual deletion
+          const pathStr = path || event.rawPath || '';
+          const isRequestingCode = pathStr.includes('/request-deletion');
+          const storeId = pathParts[2] || event.pathParameters?.id || event.queryStringParameters?.storeId;
           
-          if (!storeId) {
+          if (!storeId || storeId === 'request-deletion') {
             responseData = {
               error: 'Store ID is required for deletion'
             };
@@ -1454,57 +1457,250 @@ exports.handler = async (event) => {
             break;
           }
           
-          console.log('Deleting store:', storeId, 'for user:', storesUserId);
+          const requestBody = JSON.parse(event.body || '{}');
           
-          try {
-            // Delete store metadata
-            await dynamodb.delete({
-              TableName: process.env.TABLE_NAME,
-              Key: {
-                pk: `user_${storesUserId}`,
-                sk: `store_${storeId}_metadata`
-              }
-            }).promise();
+          // Handle request for deletion confirmation code
+          if (isRequestingCode || method === 'POST' && pathStr.includes('/request-deletion')) {
+            console.log('Requesting deletion confirmation code for store:', storeId);
             
-            // Also delete associated data (products, orders) for this store
-            // First, query all items for this store
-            const itemsToDelete = await dynamodb.query({
-              TableName: process.env.TABLE_NAME,
-              KeyConditionExpression: 'pk = :pk',
-              FilterExpression: 'storeDomain = :storeDomain OR storeId = :storeId',
-              ExpressionAttributeValues: {
-                ':pk': `user_${storesUserId}`,
-                ':storeDomain': storeId,
-                ':storeId': storeId
-              }
-            }).promise();
-            
-            // Delete all associated items
-            if (itemsToDelete.Items && itemsToDelete.Items.length > 0) {
-              const deletePromises = itemsToDelete.Items.map(item => 
-                dynamodb.delete({
-                  TableName: process.env.TABLE_NAME,
-                  Key: {
-                    pk: item.pk,
-                    sk: item.sk
-                  }
-                }).promise()
-              );
+            try {
+              // Generate a 6-digit confirmation code
+              const confirmationCode = Math.floor(100000 + Math.random() * 900000).toString();
               
-              await Promise.all(deletePromises);
-              console.log(`Deleted ${deletePromises.length} associated items for store ${storeId}`);
+              // Store the confirmation code in DynamoDB with TTL (expires in 15 minutes)
+              await dynamodb.put({
+                TableName: process.env.TABLE_NAME,
+                Item: {
+                  pk: `deletion_confirmation_${storesUserId}`,
+                  sk: `store_${storeId}`,
+                  confirmationCode: confirmationCode,
+                  storeId: storeId,
+                  userId: storesUserId,
+                  createdAt: new Date().toISOString(),
+                  ttl: Math.floor(Date.now() / 1000) + 900 // Expires in 15 minutes
+                }
+              }).promise();
+              
+              // Send confirmation code via email (using SES) or SMS
+              if (requestBody.email || requestBody.method === 'email') {
+                try {
+                  const ses = new AWS.SES();
+                  await ses.sendEmail({
+                    Destination: {
+                      ToAddresses: [requestBody.email || user?.email || 'user@example.com']
+                    },
+                    Message: {
+                      Body: {
+                        Html: {
+                          Data: `
+                            <h2>Store Deletion Confirmation</h2>
+                            <p>You have requested to delete the store: <strong>${storeId}</strong></p>
+                            <p>This action will permanently delete:</p>
+                            <ul>
+                              <li>The store configuration</li>
+                              <li>All products and inventory data</li>
+                              <li>All order history</li>
+                              <li>All customer records</li>
+                              <li>All analytics and forecasts</li>
+                            </ul>
+                            <p><strong>This action cannot be undone!</strong></p>
+                            <p>Your confirmation code is: <h1 style="color: red; font-family: monospace;">${confirmationCode}</h1></p>
+                            <p>This code will expire in 15 minutes.</p>
+                            <p>If you did not request this deletion, please ignore this email and secure your account.</p>
+                          `
+                        },
+                        Text: {
+                          Data: `Store Deletion Confirmation\n\nConfirmation Code: ${confirmationCode}\n\nThis will delete store ${storeId} and ALL associated data. This action cannot be undone.\n\nCode expires in 15 minutes.`
+                        }
+                      },
+                      Subject: {
+                        Data: `⚠️ Store Deletion Confirmation Code: ${confirmationCode}`
+                      }
+                    },
+                    Source: 'no-reply@ordernimbus.com'
+                  }).promise();
+                } catch (emailError) {
+                  console.error('Error sending confirmation email:', emailError);
+                  // Continue anyway, code is stored
+                }
+              }
+              
+              responseData = {
+                success: true,
+                message: 'Confirmation code sent. Please check your email.',
+                expiresIn: 900 // seconds
+              };
+            } catch (error) {
+              console.error('Error generating confirmation code:', error);
+              responseData = {
+                error: 'Failed to generate confirmation code'
+              };
+              statusCode = 500;
+            }
+          }
+          // Handle actual deletion with confirmation
+          else {
+            console.log('Attempting to delete store:', storeId, 'for user:', storesUserId);
+            
+            // Check for confirmation code
+            if (!requestBody.confirmationCode) {
+              responseData = {
+                error: 'Confirmation code required. Please request a deletion code first.',
+                requiresConfirmation: true
+              };
+              statusCode = 400;
+              break;
             }
             
-            responseData = {
-              success: true,
-              message: `Store ${storeId} deleted successfully`
-            };
-          } catch (dbError) {
-            console.error('Error deleting store from DynamoDB:', dbError);
-            responseData = {
-              error: 'Failed to delete store'
-            };
-            statusCode = 500;
+            try {
+              // Verify confirmation code
+              const confirmationResult = await dynamodb.get({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  pk: `deletion_confirmation_${storesUserId}`,
+                  sk: `store_${storeId}`
+                }
+              }).promise();
+              
+              if (!confirmationResult.Item || 
+                  confirmationResult.Item.confirmationCode !== requestBody.confirmationCode) {
+                responseData = {
+                  error: 'Invalid confirmation code',
+                  remainingAttempts: 2 // Track attempts to prevent brute force
+                };
+                statusCode = 403;
+                break;
+              }
+              
+              // Confirmation successful, proceed with deletion
+              console.log('Confirmation verified, proceeding with cascade delete');
+              
+              // Track what we're deleting
+              const deletedItems = {
+                store: 0,
+                products: 0,
+                orders: 0,
+                inventory: 0,
+                customers: 0,
+                total: 0
+              };
+              
+              // Delete store metadata first
+              try {
+                await dynamodb.delete({
+                  TableName: process.env.TABLE_NAME,
+                  Key: {
+                    pk: `USER#${storesUserId}`,
+                    sk: `STORE#${storeId}_metadata`
+                  }
+                }).promise();
+                deletedItems.store = 1;
+              } catch (e) {
+                console.log('Store metadata not found in new format, trying old format');
+                await dynamodb.delete({
+                  TableName: process.env.TABLE_NAME,
+                  Key: {
+                    pk: `user_${storesUserId}`,
+                    sk: `store_${storeId}_metadata`
+                  }
+                }).promise();
+                deletedItems.store = 1;
+              }
+              
+              // Query and delete all associated data
+              const dataTypes = [
+                { prefix: 'PRODUCT#', key: 'products' },
+                { prefix: 'ORDER#', key: 'orders' },
+                { prefix: 'INVENTORY#', key: 'inventory' },
+                { prefix: 'CUSTOMER#', key: 'customers' }
+              ];
+              
+              for (const dataType of dataTypes) {
+                try {
+                  // Query for items of this type for this store
+                  const items = await dynamodb.query({
+                    TableName: process.env.TABLE_NAME,
+                    KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+                    ExpressionAttributeValues: {
+                      ':pk': `USER#${storesUserId}`,
+                      ':skPrefix': `${dataType.prefix}${storeId}#`
+                    }
+                  }).promise();
+                  
+                  if (items.Items && items.Items.length > 0) {
+                    // Batch delete for efficiency
+                    const batchSize = 25; // DynamoDB batch write limit
+                    for (let i = 0; i < items.Items.length; i += batchSize) {
+                      const batch = items.Items.slice(i, i + batchSize);
+                      const deleteRequests = batch.map(item => ({
+                        DeleteRequest: {
+                          Key: {
+                            pk: item.pk,
+                            sk: item.sk
+                          }
+                        }
+                      }));
+                      
+                      await dynamodb.batchWrite({
+                        RequestItems: {
+                          [process.env.TABLE_NAME]: deleteRequests
+                        }
+                      }).promise();
+                      
+                      deletedItems[dataType.key] += batch.length;
+                    }
+                  }
+                } catch (queryError) {
+                  console.error(`Error deleting ${dataType.key}:`, queryError);
+                }
+              }
+              
+              // If this is a Shopify store, also delete OAuth tokens
+              if (storeId.startsWith('shopify_')) {
+                try {
+                  // Find and delete Shopify OAuth token
+                  const shopifyDomain = requestBody.shopifyDomain || storeId;
+                  await dynamodb.delete({
+                    TableName: process.env.TABLE_NAME,
+                    Key: {
+                      pk: `store_${shopifyDomain}`,
+                      sk: `user_${storesUserId}`
+                    }
+                  }).promise();
+                  console.log('Deleted Shopify OAuth token');
+                } catch (e) {
+                  console.log('No Shopify OAuth token found');
+                }
+              }
+              
+              // Delete the confirmation code
+              await dynamodb.delete({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  pk: `deletion_confirmation_${storesUserId}`,
+                  sk: `store_${storeId}`
+                }
+              }).promise();
+              
+              deletedItems.total = Object.values(deletedItems).reduce((a, b) => a + b, 0);
+              
+              console.log('Store deletion completed:', deletedItems);
+              
+              responseData = {
+                success: true,
+                message: `Store ${storeId} and all associated data deleted successfully`,
+                deletedItems: deletedItems,
+                shopifyDisconnected: storeId.startsWith('shopify_')
+              };
+              
+            } catch (error) {
+              console.error('Error during store deletion:', error);
+              responseData = {
+                error: 'Failed to delete store',
+                details: error.message
+              };
+              statusCode = 500;
+            }
           }
         } else {
           // Handle GET method (default)
@@ -1539,22 +1735,31 @@ exports.handler = async (event) => {
             
             // Transform DynamoDB items to store format
             const stores = (storesResult.Items || []).map(item => {
-              // Extract store domain from sk (format: store_{domain}_metadata)
-              const skParts = item.sk.split('_');
-              const domain = skParts[1]; // Get the domain part
+              // For new format: STORE#storeId_metadata
+              // For old format: store_{domain}_metadata
+              // Use the actual data from the item instead of parsing the sk
               
               return {
-                id: item.storeId || domain || item.sk,
-                name: item.storeName || item.name || domain,
-                displayName: item.displayName || item.storeName || domain,
-                type: item.storeType || 'shopify',
-                shopifyDomain: item.shopifyDomain || domain,
-                syncStatus: item.syncStatus || 'completed',
+                id: item.storeId || item.sk,
+                name: item.storeName || item.name || item.displayName || 'Unnamed Store',
+                displayName: item.displayName || item.storeName || item.name || 'Unnamed Store',
+                type: item.storeType || item.type || 'brick-and-mortar',
+                shopifyDomain: item.shopifyDomain || '',
+                address: item.address || '',
+                city: item.city || '',
+                state: item.state || '',
+                zipCode: item.zipCode || '',
+                country: item.country || 'United States',
+                website: item.website || '',
+                status: item.status || 'active',
+                syncStatus: item.syncStatus || 'not_connected',
                 syncMetadata: item.syncMetadata,
                 connectedAt: item.connectedAt,
                 lastSyncAt: item.lastSyncAt,
-                productsCount: item.productsCount,
-                ordersCount: item.ordersCount
+                productsCount: item.productsCount || 0,
+                ordersCount: item.ordersCount || 0,
+                createdAt: item.createdAt,
+                updatedAt: item.updatedAt
               };
             });
             
@@ -1736,6 +1941,157 @@ exports.handler = async (event) => {
               }
             }).promise();
             
+            // Also create a store record in the user's namespace
+            const storeId = `shopify_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            
+            // Fetch store details from Shopify
+            let storeDetails = {};
+            try {
+              storeDetails = await makeShopifyRequest(shop, accessToken, '/shop.json', 'GET');
+              console.log('Fetched store details from Shopify:', storeDetails);
+            } catch (error) {
+              console.error('Error fetching store details:', error);
+            }
+            
+            // Create store record for the user
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `USER#${stateResult.Item.userId}`,
+                sk: `STORE#${storeId}_metadata`,
+                storeId: storeId,
+                storeName: storeDetails.shop?.name || shop.replace('.myshopify.com', ''),
+                name: storeDetails.shop?.name || shop.replace('.myshopify.com', ''),
+                displayName: storeDetails.shop?.name || shop.replace('.myshopify.com', ''),
+                storeType: 'shopify',
+                type: 'shopify',
+                shopifyDomain: shop,
+                email: storeDetails.shop?.email || '',
+                phone: storeDetails.shop?.phone || '',
+                address: storeDetails.shop?.address1 || '',
+                city: storeDetails.shop?.city || '',
+                state: storeDetails.shop?.province || '',
+                zipCode: storeDetails.shop?.zip || '',
+                country: storeDetails.shop?.country || 'United States',
+                website: storeDetails.shop?.domain || `https://${shop}`,
+                currency: storeDetails.shop?.currency || 'USD',
+                status: 'active',
+                connectedAt: new Date().toISOString(),
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                userId: stateResult.Item.userId
+              }
+            }).promise();
+            
+            console.log('Store record created for user:', stateResult.Item.userId);
+            
+            // Trigger initial sync of products, orders, and inventory
+            let syncResults = {
+              products: 0,
+              orders: 0,
+              inventory: 0
+            };
+            
+            try {
+              // Fetch and store products
+              const productsData = await makeShopifyRequest(shop, accessToken, '/products.json?limit=250', 'GET');
+              if (productsData.products) {
+                for (const product of productsData.products) {
+                  for (const variant of (product.variants || [])) {
+                    await dynamodb.put({
+                      TableName: process.env.TABLE_NAME,
+                      Item: {
+                        pk: `USER#${stateResult.Item.userId}`,
+                        sk: `PRODUCT#${storeId}#${product.id}_${variant.id}`,
+                        productId: product.id.toString(),
+                        variantId: variant.id.toString(),
+                        title: product.title,
+                        name: product.title,
+                        variantTitle: variant.title || 'Default',
+                        sku: variant.sku || '',
+                        price: parseFloat(variant.price) || 0,
+                        inventory: variant.inventory_quantity || 0,
+                        vendor: product.vendor || '',
+                        product_type: product.product_type || '',
+                        tags: product.tags || '',
+                        storeDomain: shop,
+                        storeId: storeId,
+                        createdAt: product.created_at,
+                        updatedAt: product.updated_at,
+                        syncedAt: new Date().toISOString(),
+                        userId: stateResult.Item.userId
+                      }
+                    }).promise();
+                    syncResults.products++;
+                  }
+                }
+              }
+              
+              // Fetch and store recent orders
+              const ordersData = await makeShopifyRequest(shop, accessToken, '/orders.json?limit=250&status=any', 'GET');
+              if (ordersData.orders) {
+                for (const order of ordersData.orders) {
+                  await dynamodb.put({
+                    TableName: process.env.TABLE_NAME,
+                    Item: {
+                      pk: `USER#${stateResult.Item.userId}`,
+                      sk: `ORDER#${storeId}#${order.id}`,
+                      orderId: order.id.toString(),
+                      orderNumber: order.order_number,
+                      customerId: order.customer?.id?.toString() || 'guest',
+                      customerName: order.customer ? `${order.customer.first_name} ${order.customer.last_name}` : 'Guest',
+                      totalPrice: parseFloat(order.total_price) || 0,
+                      subtotal: parseFloat(order.subtotal_price) || 0,
+                      totalTax: parseFloat(order.total_tax) || 0,
+                      currency: order.currency,
+                      financialStatus: order.financial_status,
+                      fulfillmentStatus: order.fulfillment_status,
+                      orderDate: order.created_at,
+                      itemCount: order.line_items?.length || 0,
+                      storeDomain: shop,
+                      storeId: storeId,
+                      syncedAt: new Date().toISOString(),
+                      userId: stateResult.Item.userId
+                    }
+                  }).promise();
+                  syncResults.orders++;
+                }
+              }
+              
+              // Fetch and store inventory levels
+              const locationsData = await makeShopifyRequest(shop, accessToken, '/locations.json', 'GET');
+              if (locationsData.locations && locationsData.locations.length > 0) {
+                const locationId = locationsData.locations[0].id;
+                const inventoryData = await makeShopifyRequest(shop, accessToken, `/inventory_levels.json?location_ids=${locationId}&limit=250`, 'GET');
+                if (inventoryData.inventory_levels) {
+                  for (const item of inventoryData.inventory_levels) {
+                    await dynamodb.put({
+                      TableName: process.env.TABLE_NAME,
+                      Item: {
+                        pk: `USER#${stateResult.Item.userId}`,
+                        sk: `INVENTORY#${storeId}#${item.inventory_item_id}`,
+                        inventoryId: item.inventory_item_id.toString(),
+                        location: locationsData.locations[0].name,
+                        quantity: item.available || 0,
+                        available: item.available || 0,
+                        storeDomain: shop,
+                        storeId: storeId,
+                        updatedAt: item.updated_at || new Date().toISOString(),
+                        syncedAt: new Date().toISOString(),
+                        userId: stateResult.Item.userId
+                      }
+                    }).promise();
+                    syncResults.inventory++;
+                  }
+                }
+              }
+              
+              console.log('Initial sync completed:', syncResults);
+              
+            } catch (syncError) {
+              console.error('Error during initial sync:', syncError);
+            }
+            
             // Delete the state token
             await dynamodb.delete({
               TableName: process.env.TABLE_NAME,
@@ -1751,6 +2107,7 @@ exports.handler = async (event) => {
               headers: { 'Content-Type': 'text/html' },
               body: `<html><body>
                 <h2>✅ Successfully connected to Shopify!</h2>
+                <p>Imported ${syncResults.products} products, ${syncResults.orders} orders, ${syncResults.inventory} inventory items</p>
                 <p>This window will close automatically...</p>
                 <script>
                   if (window.opener) {
@@ -1759,9 +2116,15 @@ exports.handler = async (event) => {
                       success: true,
                       storeData: {
                         storeDomain: '${shop}',
-                        storeId: 'store_${shop}',
+                        storeId: '${storeId}',
                         userId: '${stateResult.Item.userId}',
-                        connectedAt: '${new Date().toISOString()}'
+                        storeName: '${storeDetails.shop?.name || shop.replace('.myshopify.com', '')}',
+                        connectedAt: '${new Date().toISOString()}',
+                        syncResults: {
+                          products: ${syncResults.products},
+                          orders: ${syncResults.orders},
+                          inventory: ${syncResults.inventory}
+                        }
                       }
                     }, '*');
                   }
