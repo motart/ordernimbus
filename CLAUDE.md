@@ -2,6 +2,194 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 🔒 UNSHAKEABLE RULES - MANDATORY FOR ALL CHANGES
+
+### RULE #1: TEST-DRIVEN DEVELOPMENT (TDD) IS MANDATORY
+**FOR EVERY FEATURE, WITHOUT EXCEPTION:**
+1. **WRITE TESTS FIRST** - Before writing ANY feature code
+2. **RUN TESTS** - Verify they fail (Red phase)
+3. **WRITE MINIMAL CODE** - Just enough to make tests pass (Green phase)
+4. **REFACTOR** - Improve code while keeping tests green
+5. **VERIFY ALL TESTS** - Run full test suite before committing
+
+**TDD WORKFLOW FOR EVERY TASK:**
+1. **CREATE** new branch from `develop` branch
+2. **WRITE FAILING TESTS** for the feature/fix
+3. **RUN TESTS LOCALLY** with `npm test` - ensure they fail appropriately
+4. **IMPLEMENT** code to make tests pass
+5. **RUN ALL TESTS** with `npm test` - ensure nothing breaks
+6. **COMMIT** only when ALL tests pass locally
+7. **CREATE** automergeable PR to `develop` with `gh pr merge <PR> --auto --squash`
+8. **IF PR TESTS FAIL**: Fix immediately before any other work
+
+**CRITICAL TDD RULES:**
+- **NEVER** write feature code without tests written first
+- **NEVER** commit code that breaks existing tests
+- **ALWAYS** run `npm test` before EVERY commit
+- **ALWAYS** fix test failures immediately - they block everything
+- **NO EXCEPTIONS** - This workflow is MANDATORY for ALL tasks
+
+### RULE #2: ALL CHANGES CREATE PR TO DEVELOP AUTOMATICALLY
+- **NEVER** commit directly to any protected branch
+- **ALWAYS** create feature branch from `develop`
+- **ALWAYS** create PR to `develop` branch (not main)
+- **NO EXCEPTIONS** - even for "quick fixes"
+
+### RULE #3: PR CANNOT MERGE IF ANY TEST FAILS
+- **ALL 7 test suites MUST pass**: Unit, Backend, Frontend, E2E, Integration, Security, Code Quality
+- **If ANY test fails → PR is BLOCKED**
+- **Cannot disable tests to make them pass**
+- **Cannot use admin override**
+
+### RULE #4: ENFORCEMENT IS AUTOMATIC
+- GitHub Actions run on EVERY pull request
+- Branch protection rules prevent bypassing
+- Git hooks enforce locally
+- **See [UNSHAKEABLE_RULES.md](./UNSHAKEABLE_RULES.md) for complete details**
+
+### RULE #5: PREVENTING TEST FAILURES - MANDATORY PRACTICES
+**BEFORE ADDING ANY NEW FEATURE:**
+1. **CHECK EXISTING TESTS** - Run `npm test` to ensure clean baseline
+2. **INSTALL DEPENDENCIES** - If adding new packages, install in BOTH locations:
+   - Root: `npm install <package>`
+   - Lambda: `cd lambda && npm install <package>`
+   - Frontend: `cd app/frontend && npm install <package>`
+3. **MOCK EXTERNAL SERVICES** - Always mock AWS, Stripe, and other external APIs in tests
+4. **TEST ISOLATION** - Each test must be independent and not affect others
+5. **CLEANUP** - Always restore mocks and clear test data in `afterEach`
+
+**COMMON TEST FAILURE CAUSES TO PREVENT:**
+- Missing npm packages in test environment → Install in all needed directories
+- AWS SDK not properly mocked → Use AWS.mock() before requiring modules
+- Stripe or external APIs not mocked → Create proper stubs
+- Tests depending on real databases → Always use mocks
+- Module cache issues → Clear require cache in beforeEach
+- Async operations not handled → Use async/await properly
+- Test data conflicts → Use unique IDs for each test
+
+## Custom Instructions & Observations for Claude
+
+### 🔐 CRITICAL PRIORITY #1: Security-First Development
+**Security must be the PRIMARY consideration in EVERY aspect of design and development.** Always ensure:
+- **Authentication & Authorization**: Use JWT tokens, never trust client-provided user IDs
+- **Data Validation**: Validate all inputs on both client and server side
+- **Secure Communication**: Always use HTTPS, never send sensitive data in URLs
+- **Least Privilege**: Grant minimum necessary permissions to users and services
+- **Secret Management**: Use AWS Secrets Manager/Parameter Store, NEVER hardcode credentials
+- **Input Sanitization**: Prevent SQL injection, XSS, and other injection attacks
+- **Audit Logging**: Log all security-relevant events for forensic analysis
+- **Zero Trust Architecture**: Verify everything, trust nothing from the client
+- **Data Encryption**: Encrypt sensitive data at rest and in transit
+- **Security Headers**: Implement proper CORS, CSP, and other security headers
+- **API Security**: All endpoints must have proper authentication (except public login/register)
+- **Session Management**: Use secure, httpOnly cookies for sessions when applicable
+- **Rate Limiting**: Implement rate limiting to prevent abuse and DDoS
+- **Dependency Security**: Regularly audit and update dependencies for security patches
+
+### 🎨 CRITICAL PRIORITY #2: UI/UX Excellence
+**UI/UX must be a top consideration in all development.** Always ensure:
+- **Immediate Visual Feedback**: Every user action must have instant visual response
+- **Smooth Animations**: State changes should use transitions (slideInScale, fadeIn, etc.)
+- **Clear Loading States**: Show spinners/progress bars for all async operations
+- **Toast Notifications**: Use react-hot-toast for all success/error/info messages
+- **No UI Bugs**: Prevent overlapping elements, stuck modals, frozen overlays
+- **Responsive Design**: Test on multiple screen sizes
+- **Visual Hierarchy**: New content should stand out (badges, animations, highlights)
+- **Error Recovery**: Guide users to fix issues, never leave them stuck
+- **Accessibility**: Proper ARIA labels, keyboard navigation, color contrast
+
+### CORE ARCHITECTURAL PRINCIPLE: Cloud-Native Application
+**This is a cloud-native application that must:**
+- Use as little custom code as possible
+- Leverage AWS IaaS and PaaS services directly (Amplify, Cognito, DynamoDB, Lambda, etc.)
+- Avoid custom implementations when AWS provides a service
+- Use AWS Amplify for authentication, data, and API management
+- Prefer managed services over self-managed solutions
+
+### IMPORTANT: User-Specific Working Patterns
+<!-- Add your observations below. Claude will follow these in all future conversations -->
+
+#### Things to Always Check
+- [ ] Check for existing CloudFormation stacks before deploying (avoid duplicate stack names)
+- [ ] Use ONLY `./deploy.sh` for deployments (consolidated master script in root)
+- [ ] Use ONLY `./teardown-production.sh` for teardowns (no variations)
+- [ ] Check for CloudFront distribution conflicts before deployment
+- [ ] Verify S3 buckets are empty before attempting stack deletion
+
+#### Known Issues & Solutions
+- **React 19 + react-icons**: Compatibility issues - use `React.createElement(IconName as any)` pattern
+- **Stack Naming**: The config.json STACK_PREFIX already contains "production", don't append environment again
+- **CloudFront CNAMEs**: Check for existing distributions using the same domain before deploying
+- **TypeScript Strict Mode**: Frontend uses strict TypeScript - always define return types for functions
+- **Script Issues**: ALWAYS fix in the original script, NEVER create new versions (no deploy-fixed.sh, deploy-v2.sh, etc.)
+- **Lambda Deployment**: If Lambda code missing, deploy.sh has fallback to use cached version from `/tmp/prod-lambda/`
+- **Shopify Redirect URI**: Must be whitelisted in Shopify Partner Dashboard - cannot be set programmatically
+- **CloudFront Deployment**: Takes 5-15 minutes to fully deploy, status changes from "InProgress" to "Deployed"
+- **Dynamic API URL**: Lambda uses `event.requestContext.domainName` to dynamically generate redirect URIs
+
+#### Preferred Development Practices
+- Always build frontend with environment variables set (REACT_APP_*)
+- Run builds from `/Users/rachid/workspace/ordernimbus/app/frontend` directory
+- Use AWS Secrets Manager for all credentials, never hardcode
+- When deployment fails, check CloudFormation stack events first
+- Deploy to staging first, then production after verification
+
+#### Command Shortcuts & Fixes
+```bash
+# Quick frontend rebuild and deploy (production)
+cd app/frontend && \
+export REACT_APP_API_URL="<API_URL>" && \
+export REACT_APP_ENVIRONMENT="production" && \
+export REACT_APP_USER_POOL_ID="<POOL_ID>" && \
+export REACT_APP_CLIENT_ID="<CLIENT_ID>" && \
+export REACT_APP_REGION="us-west-1" && \
+npm run build && \
+aws s3 sync build/ s3://<BUCKET_NAME>/ --delete --region us-west-1
+```
+
+#### Your Custom Notes
+<!-- Add your specific observations and preferences below this line -->
+<!-- Claude will integrate these into all future processing -->
+
+### CRITICAL RULE: NO HARDCODING ANYTHING!!!
+- **NEVER** put URLs, IDs, keys, or any configuration values directly in code
+- **ALWAYS** use environment variables, configuration files, or CloudFormation outputs
+- **ALWAYS** make everything configurable from external sources
+- Configuration should be:
+  - Read from `.env` files
+  - Passed as environment variables
+  - Retrieved from CloudFormation stack outputs
+  - Stored in AWS Parameter Store or Secrets Manager
+- Even "temporary" values must be configurable
+- This applies to ALL files: JavaScript, TypeScript, YAML, scripts, everything
+
+### Code Documentation Requirements
+- **ALWAYS** add detailed comments to code explaining:
+  - Purpose of functions/components
+  - Data flow and transformations
+  - Security considerations
+  - Error handling approach
+  - Integration points with other services
+- **ALWAYS** consult `CODE_MAP.md` before answering questions about the codebase
+- **ALWAYS** update `CODE_MAP.md` when making significant changes
+- Comments should explain "why" not just "what"
+- Use JSDoc format for JavaScript/TypeScript functions
+
+### Example Comment Style:
+```javascript
+/**
+ * Validates and processes Shopify webhook events
+ * @param {Object} event - API Gateway event containing webhook data
+ * @returns {Object} HTTP response with processing status
+ * 
+ * Security: Validates HMAC signature before processing
+ * Integration: Updates DynamoDB and triggers SNS notifications
+ * Error Handling: Returns 200 even on errors to prevent Shopify retries
+ */
+```
+
+---
+
 ## Project Overview
 
 Multi-tenant, highly-scalable Sales Forecasting Platform with AWS-native infrastructure, designed for brick-and-mortar retailers and Shopify merchants.
@@ -20,18 +208,27 @@ Multi-tenant, highly-scalable Sales Forecasting Platform with AWS-native infrast
 - ElastiCache Redis + DynamoDB DAX for hot-path caching
 - Tenant-aware partitioning strategy for >1M SKUs
 
+## 🚨 CRITICAL DEPLOYMENT RULES
+
+### RULE: NO SCRIPT DUPLICATION - FIX IN PLACE
+- **NEVER** create new deployment or teardown scripts to fix issues
+- **ALWAYS** fix issues within the existing scripts:
+  - `./deploy.sh` - The ONLY deployment script (root directory)
+  - `./teardown-production.sh` - The ONLY teardown script (root directory)
+- **NO EXCEPTIONS** - All deployment logic must be in these two scripts
+- If a script has an issue, fix it IN THE SCRIPT, don't create deploy-fixed.sh or similar
+- This prevents script proliferation and confusion
+
 ## Development Commands
 
 ```bash
-# Complete platform deployment
-./scripts/deployment/deploy.sh staging              # Deploy to staging
-./scripts/deployment/deploy.sh production          # Deploy to production
-./scripts/deployment/deploy.sh dev us-west-1 true  # Deploy to dev (skip tests)
+# Complete platform deployment (ONLY USE THESE)
+./deploy.sh staging              # Deploy to staging
+./deploy.sh production          # Deploy to production
+./deploy.sh local               # Setup local development
 
 # Infrastructure destruction (CAREFUL!)
-./scripts/infrastructure/destroy.sh staging            # Destroy staging environment
-./scripts/infrastructure/destroy.sh production        # Destroy production environment
-./scripts/infrastructure/destroy.sh staging us-west-1 true  # Destroy without confirmation
+./teardown-production.sh        # Destroy production environment (with confirmation)
 
 # Alternative npm commands
 npm run deploy:staging          # Deploy to staging
@@ -91,12 +288,27 @@ cd app/frontend && ./auto-deploy.sh  # Auto-build and deploy frontend to AWS S3
 ./scripts/infrastructure/destroy.sh staging us-west-1 true
 ```
 
-## Current Deployment Status
+## Current Production Deployment (us-west-1)
 
-- **Frontend**: Deployed to S3 bucket `ordernimbus-staging-frontend-assets`
-- **Frontend URL**: http://ordernimbus-staging-frontend-assets.s3-website-us-west-1.amazonaws.com
-- **Chatbot**: Fixed blank page issue, now working correctly
-- **Auto-deployment**: Configured via `app/frontend/auto-deploy.sh`
+### Live URLs
+- **Frontend**: https://app.ordernimbus.com (CloudFront + S3)
+- **API Gateway**: https://p12brily0d.execute-api.us-west-1.amazonaws.com/production
+- **API Custom Domain**: https://api.ordernimbus.com (Route53 CNAME to API Gateway)
+
+### AWS Resources
+- **CloudFormation Stack**: `ordernimbus-production`
+- **S3 Frontend Bucket**: `ordernimbus-production-frontend-335021149718`
+- **CloudFront Distribution**: `EP62VZVVDF7SQ` (serving app.ordernimbus.com)
+- **Cognito User Pool**: `us-west-1_Ht3X0tii8`
+- **Cognito Client ID**: `29ebgu8c8tit6aftprjgfmf4p4`
+- **Lambda Function**: `ordernimbus-production-main` (single monolithic handler)
+- **DynamoDB Table**: `ordernimbus-production-main`
+- **Secrets Manager**: `ordernimbus/production/shopify` (Shopify OAuth credentials)
+
+### Shopify Integration
+- **Redirect URI**: `https://p12brily0d.execute-api.us-west-1.amazonaws.com/production/api/shopify/callback`
+- **OAuth Flow**: Dynamic redirect URI generation using API Gateway context
+- **Credentials**: Stored in AWS Secrets Manager, never hardcoded
 
 ## Scalability SLOs
 
@@ -113,9 +325,49 @@ Run nightly load tests with GitHub Actions:
 - **Upload Stress**: Large file upload simulation
 - **Tenant Isolation**: Multi-tenant data isolation verification
 
+## Deployment Troubleshooting Guide
+
+### Common Deployment Issues & Fixes
+
+#### 1. Lambda Code Not Found
+**Error**: "No Lambda code found to deploy" or "S3 Error Code: NoSuchBucket"
+**Solution**: 
+- Deploy script automatically uses cached Lambda from `/tmp/prod-lambda/` if available
+- Create S3 bucket for Lambda code: `aws s3api create-bucket --bucket ordernimbus-lambda-code --region us-west-1 --create-bucket-configuration LocationConstraint=us-west-1`
+- Upload placeholder Lambda code to avoid CloudFormation failures
+
+#### 2. CloudFormation Stack Deletion Fails
+**Error**: "Stack cannot be deleted while resources exist"
+**Solution**: 
+```bash
+# Empty S3 buckets first
+aws s3 rm s3://BUCKET_NAME --recursive
+# Then delete stack
+./teardown-production.sh
+```
+
+#### 3. Shopify OAuth Redirect Mismatch
+**Error**: "Redirect URI mismatch"
+**Solution**: Lambda now dynamically generates redirect URI using API Gateway context. Update Shopify app with: `https://p12brily0d.execute-api.us-west-1.amazonaws.com/production/api/shopify/callback`
+
+#### 4. CloudFront CNAME Conflict
+**Error**: "CNAMEs you provided are already associated with a different resource"
+**Solution**: Deploy with `ENABLE_CLOUDFRONT=false` if distribution EP62VZVVDF7SQ already exists with app.ordernimbus.com
+
+#### 5. CloudFront Distribution Disabled
+**Error**: Site not accessible after teardown/redeploy
+**Solution**: Re-enable distribution:
+```bash
+aws cloudfront get-distribution-config --id DIST_ID > /tmp/cf-dist.json
+ETAG=$(jq -r '.ETag' /tmp/cf-dist.json)
+jq '.DistributionConfig.Enabled = true' /tmp/cf-dist.json > /tmp/cf-updated.json
+aws cloudfront update-distribution --id DIST_ID --distribution-config "$(jq '.DistributionConfig' /tmp/cf-updated.json)" --if-match "$ETAG"
+```
+
 ## Architecture Files
 
 - `ARCHITECTURE_PLAN.md` - Detailed 85-day implementation plan
 - `CAPACITY_PLANNING.md` - Scaling formulas and cost ceilings  
 - `tests/load/k6-suite.js` - Comprehensive load test scenarios
 - `.github/workflows/nightly-load-test.yml` - Automated performance regression testing
+- `SHOPIFY_REDIRECT_URI.md` - Current Shopify OAuth redirect configuration

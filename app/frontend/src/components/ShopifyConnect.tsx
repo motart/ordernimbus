@@ -3,7 +3,7 @@ import { SiShopify } from 'react-icons/si';
 import { FiCheck, FiLoader, FiAlertCircle } from 'react-icons/fi';
 import toast from 'react-hot-toast';
 import './ShopifyConnect.css';
-import { ENV_CONFIG, debugLog } from '../config/environment';
+import { getApiUrl, debugLog } from '../config/environment';
 
 interface ShopifyConnectProps {
   userId: string;
@@ -22,13 +22,58 @@ const ShopifyConnect: React.FC<ShopifyConnectProps> = ({ userId, onSuccess, onCa
     const handleMessage = (event: MessageEvent) => {
       console.log('Received message:', event.data);
       
-      if (event.data.type === 'shopify-oauth-success') {
-        console.log('OAuth success received:', event.data.data);
+      // Handle both message types for compatibility
+      if (event.data.type === 'shopify-oauth-success' || event.data.type === 'shopify-connected') {
+        console.log('OAuth success received:', event.data);
         setStep('success');
         setLoading(false);
         toast.success('Shopify store connected successfully!');
+        
+        // Trigger sync immediately after connection
         setTimeout(() => {
-          onSuccess(event.data.data);
+          // Use storeData from the OAuth callback if available
+          let storeData: any;
+          
+          // If we have storeData from OAuth callback, use it directly
+          if (event.data.storeData) {
+            storeData = { ...event.data.storeData };
+          } else if (event.data.data) {
+            storeData = { ...event.data.data };
+          } else {
+            // Fallback to constructing from individual fields
+            storeData = { 
+              success: event.data.success, 
+              storeId: event.data.storeId,
+              storeDomain: event.data.storeDomain,
+              userId: event.data.userId,
+              apiKey: event.data.apiKey,
+              accessToken: event.data.apiKey // Also set as accessToken for compatibility
+            };
+          }
+          
+          // Add the store domain we started with if not present
+          if (!storeData.storeDomain && !storeData.shopifyDomain && storeDomain) {
+            storeData.storeDomain = storeDomain.includes('.myshopify.com') 
+              ? storeDomain 
+              : storeDomain + '.myshopify.com';
+            storeData.shopifyDomain = storeData.storeDomain;
+          }
+          
+          // Ensure we have a store domain
+          if (storeData.storeDomain) {
+            storeData.shopifyDomain = storeData.storeDomain;
+          } else if (storeData.shopifyDomain) {
+            storeData.storeDomain = storeData.shopifyDomain;
+          }
+          
+          // Ensure API key is included if passed separately
+          if (event.data.apiKey && !storeData.apiKey) {
+            storeData.apiKey = event.data.apiKey;
+            storeData.accessToken = event.data.apiKey;
+          }
+          
+          console.log('Passing store data to success handler:', storeData);
+          onSuccess(storeData);
         }, 1500);
       } else if (event.data.type === 'shopify-oauth-error') {
         console.log('OAuth error received:', event.data.error);
@@ -63,8 +108,8 @@ const ShopifyConnect: React.FC<ShopifyConnectProps> = ({ userId, onSuccess, onCa
     setError('');
 
     try {
-      const apiUrl = ENV_CONFIG.apiUrl;
-      console.log('Connecting to:', cleanDomain, 'via API:', apiUrl);
+      const apiUrl = getApiUrl();
+      debugLog('Connecting to:', cleanDomain, 'via API:', apiUrl);
       
       // Always use OAuth mode (no dev/custom app logic)
       const response = await fetch(`${apiUrl}/api/shopify/connect`, {

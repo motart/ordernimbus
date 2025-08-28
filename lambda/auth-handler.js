@@ -4,14 +4,29 @@
 const AWS = require('aws-sdk');
 const cognito = new AWS.CognitoIdentityServiceProvider();
 const dynamodb = new AWS.DynamoDB.DocumentClient();
+const { createSubscription } = require('./subscription-manager');
 
 exports.handler = async (event) => {
   console.log('Auth Event:', JSON.stringify(event));
   
+  // Whitelist of allowed origins
+  const allowedOrigins = [
+    'https://app.ordernimbus.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000'
+  ];
+  
+  // Get the origin from the request
+  const origin = event.headers?.origin || event.headers?.Origin || '';
+  
+  // Check if origin is allowed
+  const allowOrigin = allowedOrigins.includes(origin) ? origin : 'https://app.ordernimbus.com';
+  
   const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': allowOrigin,
     'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Credentials': 'true',
     'Content-Type': 'application/json'
   };
   
@@ -86,6 +101,21 @@ exports.handler = async (event) => {
   }
 };
 
+// Input validation helper
+function validateEmail(email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+function sanitizeInput(input) {
+  if (typeof input !== 'string') return '';
+  // Remove any potential script tags or SQL injection attempts
+  return input.replace(/<script[^>]*>.*?<\/script>/gi, '')
+              .replace(/[<>"']/g, '')
+              .trim()
+              .substring(0, 500); // Limit length
+}
+
 async function handleLogin(body) {
   const { email, password } = body;
   
@@ -99,13 +129,36 @@ async function handleLogin(body) {
     };
   }
   
+  // Validate and sanitize inputs
+  const sanitizedEmail = sanitizeInput(email).toLowerCase();
+  if (!validateEmail(sanitizedEmail)) {
+    return {
+      statusCode: 400,
+      body: {
+        success: false,
+        error: 'Invalid email format'
+      }
+    };
+  }
+  
+  // Password length check
+  if (password.length < 8 || password.length > 128) {
+    return {
+      statusCode: 400,
+      body: {
+        success: false,
+        error: 'Invalid password'
+      }
+    };
+  }
+  
   try {
     const authResult = await cognito.adminInitiateAuth({
       UserPoolId: process.env.USER_POOL_ID,
       ClientId: process.env.USER_POOL_CLIENT_ID,
       AuthFlow: 'ADMIN_USER_PASSWORD_AUTH',
       AuthParameters: {
-        USERNAME: email,
+        USERNAME: sanitizedEmail,
         PASSWORD: password
       }
     }).promise();
@@ -136,7 +189,7 @@ async function handleLogin(body) {
 }
 
 async function handleRegister(body) {
-  const { email, password, companyName, firstName, lastName } = body;
+  const { email, password, companyName, firstName, lastName, planId = 'starter' } = body;
   
   if (!email || !password || !companyName) {
     return {
@@ -144,6 +197,32 @@ async function handleRegister(body) {
       body: {
         success: false,
         error: 'Email, password, and company name are required'
+      }
+    };
+  }
+  
+  // Validate and sanitize inputs
+  const sanitizedEmail = sanitizeInput(email).toLowerCase();
+  const sanitizedCompanyName = sanitizeInput(companyName);
+  const sanitizedFirstName = firstName ? sanitizeInput(firstName) : '';
+  const sanitizedLastName = lastName ? sanitizeInput(lastName) : '';
+  
+  if (!validateEmail(sanitizedEmail)) {
+    return {
+      statusCode: 400,
+      body: {
+        success: false,
+        error: 'Invalid email format'
+      }
+    };
+  }
+  
+  if (sanitizedCompanyName.length < 2 || sanitizedCompanyName.length > 100) {
+    return {
+      statusCode: 400,
+      body: {
+        success: false,
+        error: 'Company name must be between 2 and 100 characters'
       }
     };
   }
@@ -196,12 +275,12 @@ async function handleRegister(body) {
     // Create user in Cognito
     const createUserResult = await cognito.adminCreateUser({
       UserPoolId: process.env.USER_POOL_ID,
-      Username: email,
+      Username: sanitizedEmail,
       UserAttributes: [
-        { Name: 'email', Value: email },
+        { Name: 'email', Value: sanitizedEmail },
         { Name: 'email_verified', Value: 'true' },
         { Name: 'custom:company_id', Value: companyId },
-        { Name: 'custom:company_name', Value: companyName },
+        { Name: 'custom:company_name', Value: sanitizedCompanyName },
         { Name: 'custom:role', Value: 'admin' }
       ],
       TemporaryPassword: password,
@@ -211,7 +290,7 @@ async function handleRegister(body) {
     // Set permanent password
     await cognito.adminSetUserPassword({
       UserPoolId: process.env.USER_POOL_ID,
-      Username: email,
+      Username: sanitizedEmail,
       Password: password,
       Permanent: true
     }).promise();
@@ -223,13 +302,30 @@ async function handleRegister(body) {
         Item: {
           pk: `company_${companyId}`,
           sk: 'metadata',
-          companyName: companyName,
-          adminEmail: email,
-          firstName: firstName || '',
-          lastName: lastName || '',
+          companyName: sanitizedCompanyName,
+          adminEmail: sanitizedEmail,
+          firstName: sanitizedFirstName,
+          lastName: sanitizedLastName,
           createdAt: new Date().toISOString()
         }
       }).promise();
+    }
+    
+    // Create subscription for the new user
+    let subscription = null;
+    try {
+      subscription = await createSubscription(createUserResult.User.Username, planId, {
+        source: 'registration',
+        metadata: {
+          companyId,
+          companyName: sanitizedCompanyName,
+          adminEmail: sanitizedEmail
+        }
+      });
+    } catch (subError) {
+      console.error('Failed to create subscription:', subError);
+      // Don't fail registration if subscription creation fails
+      // User can be prompted to select plan after login
     }
     
     return {
@@ -239,7 +335,12 @@ async function handleRegister(body) {
         message: 'Registration successful',
         userId: createUserResult.User.Username,
         companyId: companyId,
-        companyName: companyName
+        companyName: sanitizedCompanyName,
+        subscription: subscription ? {
+          planId: subscription.planId,
+          status: subscription.status,
+          trialEnd: subscription.trialEnd
+        } : null
       }
     };
   } catch (error) {
@@ -267,10 +368,23 @@ async function handleForgotPassword(body) {
     };
   }
   
+  // Validate and sanitize email
+  const sanitizedEmail = sanitizeInput(email).toLowerCase();
+  if (!validateEmail(sanitizedEmail)) {
+    // Don't reveal if email is invalid to prevent enumeration
+    return {
+      statusCode: 200,
+      body: {
+        success: true,
+        message: 'If the email exists, a password reset link has been sent'
+      }
+    };
+  }
+  
   try {
     await cognito.forgotPassword({
       ClientId: process.env.USER_POOL_CLIENT_ID,
-      Username: email
+      Username: sanitizedEmail
     }).promise();
     
     return {

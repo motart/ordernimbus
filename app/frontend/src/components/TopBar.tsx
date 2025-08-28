@@ -5,6 +5,7 @@ import {
   FiHelpCircle
 } from 'react-icons/fi';
 import { getApiUrl } from '../config/environment';
+import { useAuth } from '../contexts/AuthContext';
 
 interface TopBarProps {
   userEmail: string;
@@ -34,13 +35,22 @@ const TopBar: React.FC<TopBarProps> = ({ userEmail, onNavigate, onLogout, active
     };
   }, []);
 
+  const { getAccessToken } = useAuth();
+
   const loadNotificationCount = async () => {
     try {
-      const userId = localStorage.getItem('currentUserId') || 'e85183d0-3061-70b8-25f5-171fd848ac9d';
-      const response = await fetch(`${getApiUrl()}/api/notifications?unreadOnly=true`, {
+      // Get the access token from AWS Amplify
+      const token = await getAccessToken();
+      if (!token) {
+        // User is not authenticated, skip loading notifications
+        return;
+      }
+
+      const apiUrl = getApiUrl();
+      const response = await fetch(`${apiUrl}/api/notifications?unreadOnly=true`, {
         headers: {
-          'Content-Type': 'application/json',
-          'userId': userId
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
         }
       });
 

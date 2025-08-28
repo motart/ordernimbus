@@ -7,7 +7,8 @@ import {
   FiCheckCircle, FiXCircle, FiRefreshCw, FiCheck,
   FiTrendingUp, FiBox, FiCheckSquare
 } from 'react-icons/fi';
-import { getApiUrl } from '../config/environment';
+import { useAuth } from '../contexts/AuthContext';
+import { createAuthenticatedFetch } from '../utils/authenticatedFetch';
 
 interface Notification {
   id: string;
@@ -22,6 +23,8 @@ interface Notification {
 }
 
 const NotificationsPage: React.FC = () => {
+  const { getAccessToken } = useAuth();
+  const authenticatedFetch = createAuthenticatedFetch({ getAccessToken });
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [filter, setFilter] = useState<'all' | 'unread'>('all');
@@ -36,14 +39,9 @@ const NotificationsPage: React.FC = () => {
 
   const loadNotifications = async () => {
     try {
-      const userId = localStorage.getItem('currentUserId') || 'e85183d0-3061-70b8-25f5-171fd848ac9d';
+      // userId is now extracted from JWT token on backend
       
-      const response = await fetch(`${getApiUrl()}/api/notifications`, {
-        headers: {
-          'Content-Type': 'application/json',
-          'userId': userId
-        }
-      });
+      const response = await authenticatedFetch(`/api/notifications`);
 
       if (response.ok) {
         const data = await response.json();
@@ -69,14 +67,10 @@ const NotificationsPage: React.FC = () => {
 
   const markAsRead = async (notificationId: string) => {
     try {
-      const userId = localStorage.getItem('currentUserId') || 'e85183d0-3061-70b8-25f5-171fd848ac9d';
+      // userId is now extracted from JWT token on backend
       
-      const response = await fetch(`${getApiUrl()}/api/notifications/${notificationId}/read`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'userId': userId
-        }
+      const response = await authenticatedFetch(`/api/notifications/${notificationId}/read`, {
+        method: 'PUT'
       });
 
       if (response.ok) {
@@ -95,14 +89,10 @@ const NotificationsPage: React.FC = () => {
 
   const markAllAsRead = async () => {
     try {
-      const userId = localStorage.getItem('currentUserId') || 'e85183d0-3061-70b8-25f5-171fd848ac9d';
+      // userId is now extracted from JWT token on backend
       
-      const response = await fetch(`${getApiUrl()}/api/notifications/read-all`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'userId': userId
-        }
+      const response = await authenticatedFetch(`/api/notifications/read-all`, {
+        method: 'PUT'
       });
 
       if (response.ok) {
@@ -175,10 +165,6 @@ const NotificationsPage: React.FC = () => {
     <div className="notifications-page">
       <header className="notifications-header">
         <div className="header-content">
-          <div className="header-left">
-            <h1>Notifications</h1>
-            <p>Stay updated with important alerts and updates</p>
-          </div>
           <div className="header-actions">
             {notifications.some(n => !n.read) && (
               <button onClick={markAllAsRead} className="mark-all-read-btn">

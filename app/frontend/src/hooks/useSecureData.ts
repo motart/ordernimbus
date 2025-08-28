@@ -41,13 +41,27 @@ export const useSecureData = (options: UseSecureDataOptions = {}): UseSecureData
       try {
         setError(null);
         
+        // Check if already initialized
+        if (dataManager.getUserContext()) {
+          setIsInitialized(true);
+          setUserContext(dataManager.getUserContext());
+          return;
+        }
+        
         // Try normal initialization first
         try {
           await dataManager.initialize();
         } catch (authError) {
-          console.warn('Normal initialization failed, trying fallback mode:', authError);
+          console.warn('Authentication failed:', authError);
           
-          // Fall back to temp mode if authentication fails
+          // In production, don't fall back - require authentication
+          if (process.env.NODE_ENV === 'production') {
+            // Don't throw, just return - authentication might be in progress
+            return;
+          }
+          
+          // Only fall back in development
+          console.warn('Running in development mode - using fallback');
           await (dataManager as any).initializeFallback();
         }
         
@@ -60,7 +74,7 @@ export const useSecureData = (options: UseSecureDataOptions = {}): UseSecureData
         }
 
         // Migrate legacy data if enabled (only in authenticated mode)
-        if (autoMigrate && !context?.userId.startsWith('temp-user')) {
+        if (autoMigrate && context && !context.userId.startsWith('local-dev')) {
           try {
             await dataManager.migrateLegacyData();
           } catch (migrationError) {
@@ -78,6 +92,12 @@ export const useSecureData = (options: UseSecureDataOptions = {}): UseSecureData
         if (onError) {
           onError(err instanceof Error ? err : new Error(errorMessage));
         }
+        
+        // In production, if initialization fails, user needs to log in
+        if (process.env.NODE_ENV === 'production' && errorMessage.includes('Authentication')) {
+          // Redirect to login page
+          window.location.href = '/login';
+        }
       }
     };
 
@@ -94,7 +114,8 @@ export const useSecureData = (options: UseSecureDataOptions = {}): UseSecureData
   // Store data securely
   const setData = useCallback(async <T>(key: string, data: T): Promise<void> => {
     if (!isInitialized) {
-      throw new Error('SecureDataManager not initialized');
+      console.warn('SecureDataManager not initialized, skipping setData for:', key);
+      return;
     }
 
     try {
@@ -110,7 +131,8 @@ export const useSecureData = (options: UseSecureDataOptions = {}): UseSecureData
   // Retrieve data securely
   const getData = useCallback(async <T>(key: string): Promise<T | null> => {
     if (!isInitialized) {
-      throw new Error('SecureDataManager not initialized');
+      console.warn('SecureDataManager not initialized, returning null for:', key);
+      return null;
     }
 
     try {
@@ -125,7 +147,8 @@ export const useSecureData = (options: UseSecureDataOptions = {}): UseSecureData
   // Remove data securely
   const removeData = useCallback(async (key: string): Promise<void> => {
     if (!isInitialized) {
-      throw new Error('SecureDataManager not initialized');
+      console.warn('SecureDataManager not initialized, skipping removeData for:', key);
+      return;
     }
 
     try {
@@ -141,7 +164,8 @@ export const useSecureData = (options: UseSecureDataOptions = {}): UseSecureData
   // Clear all user data
   const clearAllData = useCallback(async (): Promise<void> => {
     if (!isInitialized) {
-      throw new Error('SecureDataManager not initialized');
+      console.warn('SecureDataManager not initialized, skipping clearAllData');
+      return;
     }
 
     try {

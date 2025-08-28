@@ -16,7 +16,6 @@ import { SiShopify } from 'react-icons/si';
 import { MdStorefront } from 'react-icons/md';
 import useSecureData from '../hooks/useSecureData';
 import { useAuth } from '../contexts/AuthContext';
-import { authService } from '../services/auth';
 import ShopifyConnect from './ShopifyConnect';
 import CSVUploadModal from './CSVUploadModal';
 import './CSVUploadModal.css';
@@ -86,8 +85,13 @@ const StoresPage: React.FC = () => {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [storeToDelete, setStoreToDelete] = useState<Store | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [confirmationCode, setConfirmationCode] = useState('');
+  const [isRequestingCode, setIsRequestingCode] = useState(false);
+  const [codeRequested, setCodeRequested] = useState(false);
+  const [codeExpiresAt, setCodeExpiresAt] = useState<Date | null>(null);
   const [showCSVUpload, setShowCSVUpload] = useState(false);
   const [selectedStoreForCSV, setSelectedStoreForCSV] = useState<Store | null>(null);
+  const [newStoreIds, setNewStoreIds] = useState<Set<string>>(new Set()); // Track newly added stores
   const [formData, setFormData] = useState({
     name: '',
     type: 'brick-and-mortar' as Store['type'],
@@ -107,9 +111,31 @@ const StoresPage: React.FC = () => {
     isInitialized, 
     error: secureDataError, 
     setData, 
-    getData 
+    getData,
+    removeData 
   } = useSecureData();
-  const { user } = useAuth();
+  const { user, getAccessToken } = useAuth();
+
+  // Helper function for authenticated API requests
+  const authenticatedFetch = async (endpoint: string, options: RequestInit = {}) => {
+    const token = await getAccessToken();
+    if (!token) {
+      throw new Error('Authentication required. Please log in.');
+    }
+
+    const apiUrl = getApiUrl();
+    const url = endpoint.startsWith('http') ? endpoint : `${apiUrl}${endpoint}`;
+    
+    return fetch(url, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'userId': user?.userId || '', // Add userId header for Lambda
+        ...options.headers
+      }
+    });
+  };
 
   // Load stores function - moved outside useEffect to be reusable
   const loadStores = async () => {
@@ -117,14 +143,14 @@ const StoresPage: React.FC = () => {
     
     setIsLoadingStores(true);
     try {
-      // Use the authenticated API request helper
-      const response = await authService.authenticatedRequest(`/api/stores?t=${Date.now()}`);
+      // Use the authenticated fetch helper
+      const response = await authenticatedFetch(`/api/stores?t=${Date.now()}`);
       
       if (response.ok) {
         const result = await response.json();
         if (result.stores && result.stores.length >= 0) {
           setStores(result.stores);
-          console.log('Loaded stores from API:', result.stores.length, 'stores');
+          // Successfully loaded stores from API
           
           // Save to local storage as backup
           if (result.stores.length > 0) {
@@ -146,7 +172,7 @@ const StoresPage: React.FC = () => {
         const localStores = await getData<Store[]>('stores');
         if (localStores && localStores.length > 0) {
           setStores(localStores);
-          console.log('Loaded stores from local storage:', localStores.length, 'stores');
+          // Loaded stores from local storage as fallback
         }
       } catch (localError) {
         console.warn('No local stores found:', localError);
@@ -160,6 +186,31 @@ const StoresPage: React.FC = () => {
   useEffect(() => {
     loadStores();
   }, [user]);
+
+  // Refresh stores when page gains focus (e.g., navigating back)
+  useEffect(() => {
+    const handleFocus = () => {
+      // Only reload if not currently loading
+      if (!isLoadingStores) {
+        loadStores();
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    
+    // Also refresh when the component becomes visible
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && !isLoadingStores) {
+        loadStores();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isLoadingStores]);
 
   // Handle secure data errors
   useEffect(() => {
@@ -235,12 +286,8 @@ const StoresPage: React.FC = () => {
         ? `${apiUrl}/api/stores/${editingStore.id}`
         : `${apiUrl}/api/stores`;
       
-      const response = await fetch(endpoint, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'userId': user?.userId || 'test-user'
-        },
+      const response = await authenticatedFetch(endpoint, {
+        method: method,
         body: JSON.stringify(storePayload)
       });
 
@@ -283,37 +330,111 @@ const StoresPage: React.FC = () => {
 
   // Poll for Shopify sync status
   const handleShopifyConnectSuccess = async (storeData: any) => {
-    // Store has been created via OAuth, fetch the full store data
+    // Shopify connection successful, handling store data
+    
+    // Close the modal immediately for better UX
+    setShowShopifyConnect(false);
+    
+    // Show loading toast
+    toast.loading('Importing your Shopify store data...', { id: 'shopify-sync' });
+    
     try {
+      // Extract the store domain from the storeData passed from OAuth callback
+      const storeDomain = storeData.storeDomain || storeData.shopifyDomain || storeData.shop || '';
+      const storeId = storeData.storeId || storeDomain.replace('.myshopify.com', '');
+      const userId = user?.userId || storeData.userId || 'test-user';
+      
+      // Validate we have required data
+      if (!storeDomain) {
+        throw new Error('Store domain is missing from OAuth callback');
+      }
+      
+      if (!userId) {
+        throw new Error('User ID is missing');
+      }
+      
+      // Syncing with store
+      
+      // First, trigger the sync endpoint to start importing data
       const apiUrl = getApiUrl();
-      const response = await fetch(`${apiUrl}/api/stores`, {
-        headers: {
-          'userId': user?.userId || 'test-user'
-        }
+      const syncResponse = await authenticatedFetch(`/api/shopify/sync`, {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: userId,  // Required parameter
+          shopifyDomain: storeDomain,  // The Lambda expects this field name
+          storeId: storeId,
+          syncType: 'initial'  // Optional: specify sync type
+        })
       });
       
-      if (response.ok) {
-        const result = await response.json();
-        const newStore = result.stores.find((s: Store) => s.id === storeData.storeId);
+      if (syncResponse.ok) {
+        const syncResult = await syncResponse.json();
+        // Sync initiated successfully
         
-        if (newStore) {
-          // Update stores list with the new store
-          const updatedStores = [...stores, newStore];
-          setStores(updatedStores);
-          await setData('stores', updatedStores);
+        // Update the toast with progress
+        toast.success(`✅ Connected! Imported ${syncResult.data?.products || 0} products, ${syncResult.data?.orders || 0} orders`, { 
+          id: 'shopify-sync',
+          duration: 5000 
+        });
+        
+        // Store the previous store IDs before reloading
+        const previousStoreIds = new Set(stores.map(s => s.id));
+        
+        // Reload stores to show the new store
+        await loadStores();
+        
+        // Find the newly added store
+        setStores(prevStores => {
+          const newStore = prevStores.find((s: Store) => 
+            !previousStoreIds.has(s.id) && (
+              s.shopifyDomain === storeData.storeDomain || 
+              s.myshopifyDomain === storeData.storeDomain
+            )
+          );
           
-          toast.success(`✅ ${newStore.name} connected! Syncing data...`);
+          if (newStore) {
+            // Mark this store as new for animation
+            setNewStoreIds(prev => new Set(prev).add(newStore.id));
+            
+            // Remove the "new" status after animation completes
+            setTimeout(() => {
+              setNewStoreIds(prev => {
+                const updated = new Set(prev);
+                updated.delete(newStore.id);
+                return updated;
+              });
+            }, 5000); // Keep "new" badge for 5 seconds
+            
+            toast.success(`🎉 ${newStore.name || 'Your Shopify store'} is ready to use!`, { duration: 4000 });
+          }
           
-          // Start polling for sync status
-          setTimeout(() => pollSyncStatus(storeData.storeId), 3000);
+          return prevStores;
+        });
+      } else {
+        // Handle non-ok response
+        const errorText = await syncResponse.text();
+        let errorMessage = 'Store connected but data sync failed';
+        
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMessage = errorData.error || errorMessage;
+          console.error('Sync error:', errorData);
+        } catch {
+          console.error('Sync error (non-JSON):', errorText);
         }
+        
+        // Even if sync fails, try to load the stores
+        await loadStores();
+        toast.error(`${errorMessage}. Try manual sync.`, { id: 'shopify-sync' });
       }
-    } catch (error) {
-      console.error('Failed to fetch store after OAuth:', error);
-      toast.error('Store connected but failed to load details');
+    } catch (error: any) {
+      console.error('Failed to sync Shopify store:', error);
+      const errorMessage = error.message || 'Connection successful but sync failed';
+      toast.error(`${errorMessage}. Please try manual sync.`, { id: 'shopify-sync' });
+      
+      // Still reload stores even if sync failed
+      await loadStores();
     }
-    
-    setShowShopifyConnect(false);
   };
 
   const pollSyncStatus = async (storeId: string) => {
@@ -323,11 +444,7 @@ const StoresPage: React.FC = () => {
     
     const checkStatus = async () => {
       try {
-        const response = await fetch(`${apiUrl}/api/stores`, {
-          headers: {
-            'userId': user?.userId || 'test-user'
-          }
-        });
+        const response = await authenticatedFetch(`/api/stores`);
         
         if (response.ok) {
           const result = await response.json();
@@ -390,25 +507,45 @@ const StoresPage: React.FC = () => {
     try {
       const apiUrl = getApiUrl();
       
-      // Call API to delete store
-      const response = await fetch(`${apiUrl}/api/stores/${storeToDelete.id}`, {
-        method: 'DELETE',
-        headers: {
-          'userId': user?.userId || 'test-user'
-        }
+      // Call API to delete store using DELETE method
+      const response = await authenticatedFetch(`/api/stores/${storeToDelete.id}`, {
+        method: 'DELETE'
       });
 
       if (response.ok) {
+        const result = await response.json();
+        
+        // Remove the deleted store from local state
         const updatedStores = stores.filter(store => store.id !== storeToDelete.id);
         setStores(updatedStores);
+        
+        // Update local cache
         await setData('stores', updatedStores);
-        toast.success(`${storeToDelete.name} has been deleted`);
+        
+        // Clear any additional cache if indicated by backend
+        if (result.clearCache && result.cacheKey) {
+          try {
+            await removeData(result.cacheKey);
+          } catch (e) {
+            console.log('Could not clear cache:', e);
+          }
+        }
+        
+        toast.success(`${storeToDelete.name} has been deleted successfully`);
+        
+        // Optionally reload stores to ensure consistency
+        // This ensures we're in sync with the backend
+        setTimeout(() => {
+          loadStores();
+        }, 500);
       } else {
-        throw new Error('Failed to delete store');
+        const errorData = await response.json().catch(() => ({}));
+        const errorMessage = errorData.error || 'Failed to delete store';
+        throw new Error(errorMessage);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to delete store:', error);
-      toast.error('Failed to delete store');
+      toast.error(error.message || 'Failed to delete store');
     } finally {
       setIsDeleting(false);
       setShowDeleteModal(false);
@@ -433,17 +570,13 @@ const StoresPage: React.FC = () => {
       const apiUrl = getApiUrl();
       const endpoint = dataType === 'orders' ? '/api/orders/upload-csv' : '/api/data/upload-csv';
       
-      const response = await fetch(`${apiUrl}${endpoint}`, {
+      const response = await authenticatedFetch(endpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'userId': user?.userId || 'test-user'
-        },
         body: JSON.stringify({
+          dataType: dataType,
           storeId: selectedStoreForCSV.id,
-          csvData,
-          columnMappings,
-          dataType
+          data: csvData,
+          columnMappings: columnMappings
         })
       });
 
@@ -494,19 +627,11 @@ const StoresPage: React.FC = () => {
       toast('🔄 Starting manual sync...', { duration: 2000 });
       
       const apiUrl = getApiUrl();
-      const response = await fetch(`${apiUrl}/api/shopify/sync`, {
+      const response = await authenticatedFetch(`/api/shopify/sync`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'userId': user?.userId || 'test-user'
-        },
         body: JSON.stringify({
-          userId: user?.userId || 'test-user',
           storeId: store.id,
-          shopifyDomain: store.shopifyDomain,
-          apiKey: store.apiKey,
-          syncType: 'full',
-          locationId: store.primaryLocationId
+          shop: store.shopifyDomain
         })
       });
 
@@ -632,14 +757,6 @@ const StoresPage: React.FC = () => {
   if (!isInitialized || isLoadingStores) {
     return (
       <div className="stores-page">
-        <div className="page-header">
-          <div className="header-content">
-            <h1>
-              Stores
-              <span className="page-subtitle">Manage your retail locations and online stores</span>
-            </h1>
-          </div>
-        </div>
         <div style={{
           display: 'flex',
           justifyContent: 'center',
@@ -665,9 +782,6 @@ const StoresPage: React.FC = () => {
   return (
     <div className="stores-page">
       <div className="page-header">
-        <div className="header-content">
-          <h1>Stores</h1>
-        </div>
         <div className="header-actions">
           <button className="btn-shopify" onClick={() => setShowShopifyConnect(true)}>
             {React.createElement(SiShopify as any)}
@@ -707,7 +821,7 @@ const StoresPage: React.FC = () => {
 
       <div className="stores-grid">
         {stores.map(store => (
-          <div key={store.id} className="store-card">
+          <div key={store.id} className={`store-card ${newStoreIds.has(store.id) ? 'new-store' : ''}`}>
             <div className="store-header">
               <div className="store-icon">
                 {getStoreIcon(store.type)}
@@ -726,6 +840,7 @@ const StoresPage: React.FC = () => {
                   className="btn-icon delete" 
                   onClick={() => handleDeleteClick(store)}
                   title="Delete store"
+                  data-testid={`delete-${store.id}`}
                 >
                   {React.createElement(FiTrash2 as any)}
                 </button>

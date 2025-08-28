@@ -19,6 +19,11 @@ Parameters:
       - 'true'
       - 'false'
     Description: Enable CloudFront distribution (requires certificate in us-east-1)
+  
+  LambdaCodeBucket:
+    Type: String
+    Default: 'ordernimbus-lambda-code'
+    Description: S3 bucket containing Lambda function code
 
 Conditions:
   CreateApiDNS: !Not [!Equals [!Ref HostedZoneId, '']]
@@ -46,8 +51,20 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: '*'
-                Resource: '*'
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                Resource: 
+                  - !GetAtt MainTable.Arn
+                  - !Sub '${MainTable.Arn}/index/*'
+                  - !GetAtt SubscriptionTable.Arn
+                  - !Sub '${SubscriptionTable.Arn}/index/*'
         - PolicyName: SecretsManagerAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -57,6 +74,16 @@ Resources:
                   - 'secretsmanager:GetSecretValue'
                   - 'secretsmanager:DescribeSecret'
                 Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ordernimbus/*'
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ordernimbus/*'
         - PolicyName: CognitoAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -69,6 +96,7 @@ Resources:
                   - 'cognito-idp:AdminInitiateAuth'
                   - 'cognito-idp:AdminSetUserPassword'
                   - 'cognito-idp:ListUsers'
+                  - 'cognito-idp:ForgotPassword'
                 Resource: !GetAtt UserPool.Arn
 
   # ==================== AWS COGNITO USER POOL ====================
@@ -124,7 +152,7 @@ Resources:
       IdTokenValidity: 24
       RefreshTokenValidity: 30
 
-  # ==================== SINGLE DYNAMODB TABLE ====================
+  # ==================== DYNAMODB TABLES ====================
   MainTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -140,6 +168,44 @@ Resources:
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+  
+  # Subscription Management Table
+  SubscriptionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'ordernimbus-production-subscriptions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: subscriptionId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: planId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: subscriptionId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: userId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PlanIndex
+          KeySchema:
+            - AttributeName: planId
+              KeyType: HASH
+            - AttributeName: userId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
 
   # ==================== S3 BUCKET ====================
   FrontendBucket:
@@ -150,16 +216,26 @@ Resources:
         IndexDocument: index.html
         ErrorDocument: index.html
       PublicAccessBlockConfiguration:
-        BlockPublicAcls: false
-        BlockPublicPolicy: false
-        IgnorePublicAcls: false
-        RestrictPublicBuckets: false
+        BlockPublicAcls: !If [CreateCloudFront, true, false]
+        BlockPublicPolicy: !If [CreateCloudFront, true, false]
+        IgnorePublicAcls: !If [CreateCloudFront, true, false]
+        RestrictPublicBuckets: !If [CreateCloudFront, true, false]
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ['*']
             AllowedMethods: [GET, HEAD]
-            AllowedOrigins: ['*']
+            AllowedOrigins: 
+              - 'https://app.ordernimbus.com'
+              - 'http://localhost:3000'
             MaxAge: 3600
+
+  # CloudFront Origin Access Identity for secure S3 access
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Condition: CreateCloudFront
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${AWS::StackName}'
 
   FrontendBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -167,11 +243,23 @@ Resources:
       Bucket: !Ref FrontendBucket
       PolicyDocument:
         Statement:
+          - Sid: AllowCloudFrontAccess
+            Effect: Allow
+            Principal:
+              AWS: !If 
+                - CreateCloudFront
+                - !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginAccessIdentity}'
+                - '*'
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
           - Sid: PublicReadGetObject
             Effect: Allow
             Principal: '*'
             Action: s3:GetObject
             Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
 
   # ==================== SSL CERTIFICATE ====================
   # Note: Certificate must be in us-east-1 for CloudFront
@@ -203,16 +291,12 @@ Resources:
           MinimumProtocolVersion: TLSv1.2_2021
           SslSupportMethod: sni-only
         
-        # S3 Origin
+        # S3 Origin with OAI
         Origins:
           - Id: S3Origin
-            DomainName: !Sub '${FrontendBucket}.s3-website-${AWS::Region}.amazonaws.com'
-            CustomOriginConfig:
-              HTTPPort: 80
-              HTTPSPort: 443
-              OriginProtocolPolicy: http-only
-              OriginSSLProtocols:
-                - TLSv1.2
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginAccessIdentity}'
         
         # Default Cache Behavior
         DefaultCacheBehavior:
@@ -433,6 +517,23 @@ Resources:
                       { id: '2', type: 'warning', message: 'Low inventory alert' }
                     ],
                     count: 2
+                  };
+                  break;
+                  
+                case 'config':
+                  // Return application configuration
+                  responseData = {
+                    environment: process.env.ENVIRONMENT || 'production',
+                    apiUrl: `https://${event.requestContext?.domainName || event.headers?.host}/${event.requestContext?.stage || 'production'}`,
+                    region: process.env.AWS_REGION || 'us-west-1',
+                    userPoolId: process.env.USER_POOL_ID,
+                    clientId: process.env.USER_POOL_CLIENT_ID,
+                    features: {
+                      enableDebug: false,
+                      enableAnalytics: true,
+                      enableMockData: false,
+                      useWebCrypto: true
+                    }
                   };
                   break;
                   
@@ -878,6 +979,85 @@ Resources:
             }
           };
 
+  # ==================== PAYMENT LAMBDA FUNCTION ====================
+  PaymentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'ordernimbus-production-payment'
+      Runtime: nodejs16.x
+      Handler: payment-handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          MAIN_TABLE_NAME: !Ref MainTable
+          ENVIRONMENT: production
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: 'lambda/payment-handler.zip'
+
+  # Payment Lambda Permission for API Gateway
+  PaymentLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PaymentLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  # Payment Lambda Integration
+  PaymentLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${PaymentLambda}'
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  # Payment API Routes
+  ApiPaymentSetupRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'POST /api/payment/setup-intent'
+      Target: !Sub 'integrations/${PaymentLambdaIntegration}'
+
+  ApiPaymentMethodsGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'GET /api/payment/methods'
+      Target: !Sub 'integrations/${PaymentLambdaIntegration}'
+
+  ApiPaymentMethodsPutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'PUT /api/payment/methods'
+      Target: !Sub 'integrations/${PaymentLambdaIntegration}'
+
+  ApiPaymentMethodsDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'DELETE /api/payment/methods'
+      Target: !Sub 'integrations/${PaymentLambdaIntegration}'
+
+  ApiPaymentSubscriptionRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'POST /api/payment/subscription'
+      Target: !Sub 'integrations/${PaymentLambdaIntegration}'
+
+  ApiPaymentWebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: 'POST /api/payment/webhook'
+      Target: !Sub 'integrations/${PaymentLambdaIntegration}'
+
   # ==================== API GATEWAY (Simplified) ====================
   ApiGateway:
     Type: AWS::ApiGatewayV2::Api
@@ -996,6 +1176,39 @@ Resources:
       ApiId: !Ref ApiGateway
       RouteKey: 'ANY /api/auth/{proxy+}'
       Target: !Sub 'integrations/${LambdaIntegration}'
+
+  # ==================== SSM PARAMETERS FOR CONFIGURATION ====================
+  UserPoolIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /ordernimbus/production/cognito/user-pool-id
+      Type: String
+      Value: !Ref UserPool
+      Description: Cognito User Pool ID for OrderNimbus
+      
+  UserPoolClientIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /ordernimbus/production/cognito/client-id
+      Type: String
+      Value: !Ref UserPoolClient
+      Description: Cognito Client ID for OrderNimbus
+      
+  ApiEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /ordernimbus/production/api/endpoint
+      Type: String
+      Value: !Sub '${ApiGateway.ApiEndpoint}/production'
+      Description: API Gateway endpoint for OrderNimbus
+      
+  FrontendDomainParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /ordernimbus/production/frontend/cloudfront-domain
+      Type: String
+      Value: app.ordernimbus.com
+      Description: CloudFront domain for OrderNimbus frontend
 
 Outputs:
   FrontendURL:

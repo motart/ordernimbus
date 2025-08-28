@@ -1,0 +1,2824 @@
+const AWS = require('aws-sdk');
+const https = require('https');
+const querystring = require('querystring');
+
+// Configure AWS SDK with region
+AWS.config.update({ region: process.env.AWS_REGION || 'us-west-1' });
+
+// Create AWS service instances conditionally to handle test environments
+const secretsManager = new AWS.SecretsManager();
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+// Extract userId from JWT token (basic decoding without verification)
+const extractUserIdFromToken = async (authHeader) => {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    console.log('No Bearer token found in Authorization header');
+    return null;
+  }
+  
+  const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+  
+  try {
+    // JWT tokens have three parts separated by dots: header.payload.signature
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      console.log('Invalid JWT format');
+      return null;
+    }
+    
+    // Decode the payload (second part)
+    // Add padding if necessary for proper Base64 decoding
+    let payload = parts[1];
+    while (payload.length % 4) {
+      payload += '=';
+    }
+    
+    // Decode from Base64
+    const decodedPayload = Buffer.from(payload, 'base64').toString('utf8');
+    const payloadObj = JSON.parse(decodedPayload);
+    
+    console.log('Decoded JWT payload - sub:', payloadObj.sub);
+    
+    // For Cognito tokens, the user ID is typically in the 'sub' claim
+    // We'll check multiple possible fields for flexibility
+    const userId = payloadObj.sub || 
+                   payloadObj['cognito:username'] || 
+                   payloadObj.username ||
+                   payloadObj.email;
+    
+    console.log('Extracted userId from JWT:', userId);
+    return userId;
+  } catch (error) {
+    console.error('Error extracting userId from token:', error);
+    return null;
+  }
+};
+
+// Cache for Shopify credentials
+let shopifyCredentials = null;
+
+// Get Shopify credentials from Secrets Manager
+const getShopifyCredentials = async () => {
+  if (shopifyCredentials) return shopifyCredentials;
+  
+  try {
+    const secret = await secretsManager.getSecretValue({ 
+      SecretId: 'ordernimbus/production/shopify' 
+    }).promise();
+    
+    shopifyCredentials = JSON.parse(secret.SecretString);
+    console.log('Retrieved Shopify credentials from Secrets Manager');
+    return shopifyCredentials;
+  } catch (error) {
+    console.error('Error getting Shopify credentials:', error);
+    // Return empty credentials to avoid breaking
+    return { SHOPIFY_CLIENT_ID: '', SHOPIFY_CLIENT_SECRET: '' };
+  }
+};
+
+// Helper function to make Shopify API requests
+const makeShopifyRequest = async (shop, accessToken, endpoint, method = 'GET', body = null) => {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: shop,
+      path: `/admin/api/2024-10${endpoint}`,
+      method: method,
+      headers: {
+        'X-Shopify-Access-Token': accessToken,
+        'Content-Type': 'application/json'
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const result = JSON.parse(data);
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(result);
+          } else {
+            console.error('Shopify API error:', result);
+            reject(new Error(`Shopify API error: ${result.errors || JSON.stringify(result)}`));
+          }
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    
+    req.on('error', reject);
+    if (body) {
+      req.write(JSON.stringify(body));
+    }
+    req.end();
+  });
+};
+
+exports.handler = async (event) => {
+  console.log('Event:', JSON.stringify(event));
+  
+  // Get origin from request headers
+  const origin = event.headers?.origin || event.headers?.Origin || 'http://app.ordernimbus.com';
+  
+  // List of allowed origins
+  const allowedOrigins = [
+    'http://app.ordernimbus.com',
+    'https://app.ordernimbus.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://app.ordernimbus.com.s3-website-us-west-1.amazonaws.com',
+    'http://app.ordernimbus.com.s3-website-us-east-1.amazonaws.com'
+  ];
+  
+  // Check if origin is allowed - also support CloudFront distributions
+  let allowOrigin = allowedOrigins[0]; // Default
+  if (allowedOrigins.includes(origin)) {
+    allowOrigin = origin;
+  } else if (origin && origin.match(/^https?:\/\/[a-z0-9]+\.cloudfront\.net$/)) {
+    // Allow any CloudFront distribution
+    allowOrigin = origin;
+  }
+  
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,userId',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS,HEAD,PATCH',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Max-Age': '86400',
+    'Content-Type': 'application/json'
+  };
+  
+  // Handle OPTIONS for CORS preflight
+  if (event.requestContext?.http?.method === 'OPTIONS' || event.httpMethod === 'OPTIONS') {
+    console.log('Handling OPTIONS request for CORS');
+    return { 
+      statusCode: 200, 
+      headers: corsHeaders, 
+      body: JSON.stringify({ message: 'CORS preflight successful' }) 
+    };
+  }
+  
+  // Extract path and method
+  let path = event.rawPath || event.path || event.requestContext?.path || '/';
+  const method = event.requestContext?.http?.method || event.httpMethod || event.requestContext?.httpMethod || 'GET';
+  
+  console.log('Original path:', path);
+  
+  // Remove stage from path if present (e.g., /production/api/... -> /api/...)
+  if (path.startsWith('/production')) {
+    path = path.substring('/production'.length);
+  }
+  
+  const pathParts = path.split('/').filter(p => p);
+  console.log('Path parts:', pathParts);
+  
+  // Simple routing
+  const resource = pathParts[1] || pathParts[0]; // api/products -> products, or just config -> config
+  
+  try {
+    // Mock data based on resource
+    let responseData = {};
+    
+    console.log('Resource to match:', resource);
+    
+    switch(resource) {
+      case 'products':
+        // Extract userId from JWT token
+        const productsAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let productsUserId = await extractUserIdFromToken(productsAuthHeader);
+        
+        // Fallback to header if JWT extraction fails (for backward compatibility)
+        if (!productsUserId) {
+          productsUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!productsUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        // Handle POST method for creating products
+        if (method === 'POST') {
+          console.log('Creating new product for user:', productsUserId);
+          
+          try {
+            // Parse request body
+            const requestBody = JSON.parse(event.body || '{}');
+            const productStoreId = requestBody.storeId;
+            
+            if (!productStoreId) {
+              responseData = {
+                error: 'Store ID is required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Generate product ID
+            const productId = requestBody.id || `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            const variantId = requestBody.variantId || `variant_${productId}`;
+            
+            // Create product item
+            const productItem = {
+              pk: `USER#${productsUserId}`,
+              sk: `PRODUCT#${productStoreId}#${productId}`,
+              productId: productId,
+              variantId: variantId,
+              title: requestBody.title || requestBody.name,
+              name: requestBody.title || requestBody.name,
+              variantTitle: requestBody.variantTitle || 'Default',
+              sku: requestBody.sku || '',
+              price: requestBody.price || 0,
+              inventory: requestBody.inventory_quantity || requestBody.inventory || 0,
+              vendor: requestBody.vendor || '',
+              product_type: requestBody.product_type || '',
+              description: requestBody.description || '',
+              tags: requestBody.tags || '',
+              weight: requestBody.weight || 0,
+              compare_at_price: requestBody.compare_at_price || null,
+              storeDomain: productStoreId,
+              storeId: productStoreId,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              syncedAt: new Date().toISOString(),
+              userId: productsUserId
+            };
+            
+            // Save to DynamoDB
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: productItem
+            }).promise();
+            
+            console.log('Product created successfully:', productId);
+            
+            responseData = {
+              success: true,
+              product: {
+                id: productId,
+                variantId: variantId,
+                name: productItem.title,
+                sku: productItem.sku,
+                price: productItem.price,
+                inventory: productItem.inventory
+              }
+            };
+          } catch (error) {
+            console.error('Error creating product:', error);
+            responseData = {
+              success: false,
+              error: 'Failed to create product'
+            };
+            statusCode = 500;
+          }
+          break;
+        }
+        
+        // Handle PUT method for updating products
+        if (method === 'PUT') {
+          console.log('Updating product for user:', productsUserId);
+          
+          try {
+            const requestBody = JSON.parse(event.body || '{}');
+            const productId = requestBody.id || requestBody.productId;
+            const productStoreId = requestBody.storeId;
+            
+            if (!productId || !productStoreId) {
+              responseData = {
+                error: 'Product ID and Store ID are required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Update product in DynamoDB
+            const updateExpression = [];
+            const expressionAttributeNames = {};
+            const expressionAttributeValues = {};
+            
+            const fieldsToUpdate = ['title', 'name', 'sku', 'price', 'inventory', 'vendor', 'product_type', 'description', 'tags'];
+            
+            fieldsToUpdate.forEach(field => {
+              if (requestBody[field] !== undefined) {
+                updateExpression.push(`#${field} = :${field}`);
+                expressionAttributeNames[`#${field}`] = field;
+                expressionAttributeValues[`:${field}`] = requestBody[field];
+              }
+            });
+            
+            if (updateExpression.length > 0) {
+              updateExpression.push('#updatedAt = :updatedAt');
+              expressionAttributeNames['#updatedAt'] = 'updatedAt';
+              expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+              
+              await dynamodb.update({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  pk: `USER#${productsUserId}`,
+                  sk: `PRODUCT#${productStoreId}#${productId}`
+                },
+                UpdateExpression: `SET ${updateExpression.join(', ')}`,
+                ExpressionAttributeNames: expressionAttributeNames,
+                ExpressionAttributeValues: expressionAttributeValues
+              }).promise();
+              
+              responseData = {
+                success: true,
+                message: 'Product updated successfully'
+              };
+            } else {
+              responseData = {
+                success: false,
+                message: 'No fields to update'
+              };
+            }
+          } catch (error) {
+            console.error('Error updating product:', error);
+            responseData = {
+              success: false,
+              error: 'Failed to update product'
+            };
+            statusCode = 500;
+          }
+          break;
+        }
+        
+        // Handle GET method (existing code)
+        const storeId = event.queryStringParameters?.storeId;
+        
+        console.log('Fetching products for user:', productsUserId, 'store:', storeId);
+        
+        try {
+          // Query DynamoDB for synced products (both formats)
+          const [newFormatProducts, oldFormatProducts] = await Promise.all([
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${productsUserId}`,
+                ':skPrefix': 'PRODUCT#'
+              },
+              Limit: 100
+            }).promise(),
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `user_${productsUserId}`,
+                ':skPrefix': 'product_'
+              },
+              Limit: 100
+            }).promise()
+          ]);
+          
+          const productsResult = {
+            Items: [...(newFormatProducts.Items || []), ...(oldFormatProducts.Items || [])]
+          };
+          
+          console.log(`Found ${productsResult.Items?.length || 0} products in DynamoDB`);
+          
+          // Transform DynamoDB items to frontend format
+          const products = (productsResult.Items || []).map(item => ({
+            id: item.productId,
+            variantId: item.variantId,
+            name: item.title,
+            variantTitle: item.variantTitle,
+            sku: item.sku || '',
+            price: parseFloat(item.price || 0),
+            inventory: item.inventory || 0,
+            storeDomain: item.storeDomain,
+            syncedAt: item.syncedAt
+          }));
+          
+          responseData = {
+            products: products,
+            count: products.length,
+            source: 'dynamodb'
+          };
+        } catch (dbError) {
+          console.error('Error fetching products from DynamoDB:', dbError);
+          // Fallback to mock data if DB fails
+          responseData = {
+            products: [
+              { id: '1', name: 'Product 1', price: 99.99, inventory: 100 },
+              { id: '2', name: 'Product 2', price: 149.99, inventory: 50 }
+            ],
+            count: 2,
+            source: 'mock',
+            error: 'Failed to fetch from database'
+          };
+        }
+        break;
+        
+      case 'orders':
+        // Extract userId from JWT token
+        const ordersAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let ordersUserId = await extractUserIdFromToken(ordersAuthHeader);
+        
+        // Fallback to header if JWT extraction fails (for backward compatibility)
+        if (!ordersUserId) {
+          ordersUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!ordersUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        // Handle POST method for creating orders
+        if (method === 'POST') {
+          console.log('Creating new order for user:', ordersUserId);
+          
+          try {
+            // Parse request body
+            const requestBody = JSON.parse(event.body || '{}');
+            const orderStoreId = requestBody.storeId;
+            
+            if (!orderStoreId) {
+              responseData = {
+                error: 'Store ID is required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Generate order ID and number
+            const orderId = requestBody.id || `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            const orderNumber = requestBody.name || requestBody.orderNumber || `#${Math.floor(1000 + Math.random() * 9000)}`;
+            
+            // Create order item
+            const orderItem = {
+              pk: `USER#${ordersUserId}`,
+              sk: `ORDER#${orderStoreId}#${orderId}`,
+              orderId: orderId,
+              orderNumber: orderNumber,
+              name: orderNumber,
+              customerEmail: requestBody.email || requestBody.customerEmail,
+              customerName: requestBody.billing_first_name && requestBody.billing_last_name 
+                ? `${requestBody.billing_first_name} ${requestBody.billing_last_name}`
+                : requestBody.customerName || requestBody.email,
+              phone: requestBody.phone || '',
+              totalPrice: requestBody.total_price || requestBody.total || 0,
+              currency: requestBody.currency || 'USD',
+              status: requestBody.financial_status || requestBody.status || 'pending',
+              fulfillmentStatus: requestBody.fulfillment_status || requestBody.fulfillmentStatus || 'unfulfilled',
+              billingFirstName: requestBody.billing_first_name || '',
+              billingLastName: requestBody.billing_last_name || '',
+              billingAddress1: requestBody.billing_address1 || '',
+              billingCity: requestBody.billing_city || '',
+              billingProvince: requestBody.billing_province || requestBody.billing_state || '',
+              billingZip: requestBody.billing_zip || '',
+              billingCountry: requestBody.billing_country || 'United States',
+              shippingFirstName: requestBody.shipping_first_name || requestBody.billing_first_name || '',
+              shippingLastName: requestBody.shipping_last_name || requestBody.billing_last_name || '',
+              shippingAddress1: requestBody.shipping_address1 || requestBody.billing_address1 || '',
+              shippingCity: requestBody.shipping_city || requestBody.billing_city || '',
+              shippingProvince: requestBody.shipping_province || requestBody.billing_province || '',
+              shippingZip: requestBody.shipping_zip || requestBody.billing_zip || '',
+              shippingCountry: requestBody.shipping_country || requestBody.billing_country || 'United States',
+              lineItemName: requestBody.lineitem_name || '',
+              lineItemQuantity: requestBody.lineitem_quantity || 1,
+              lineItemPrice: requestBody.lineitem_price || 0,
+              lineItemSku: requestBody.lineitem_sku || '',
+              lineItems: requestBody.lineItems || 1,
+              tags: requestBody.tags || '',
+              note: requestBody.note || '',
+              storeDomain: orderStoreId,
+              storeId: orderStoreId,
+              createdAt: requestBody.created_at || new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              syncedAt: new Date().toISOString(),
+              userId: ordersUserId
+            };
+            
+            // Save to DynamoDB
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: orderItem
+            }).promise();
+            
+            console.log('Order created successfully:', orderId);
+            
+            responseData = {
+              success: true,
+              order: {
+                id: orderId,
+                orderNumber: orderNumber,
+                customerEmail: orderItem.customerEmail,
+                total: orderItem.totalPrice,
+                status: orderItem.status
+              }
+            };
+          } catch (error) {
+            console.error('Error creating order:', error);
+            responseData = {
+              success: false,
+              error: 'Failed to create order'
+            };
+            statusCode = 500;
+          }
+          break;
+        }
+        
+        // Handle GET method (existing code)
+        console.log('Fetching orders for user:', ordersUserId);
+        
+        try {
+          // Query DynamoDB for synced orders (both formats)
+          const [newFormatOrders, oldFormatOrders] = await Promise.all([
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${ordersUserId}`,
+                ':skPrefix': 'ORDER#'
+              },
+              Limit: 100
+            }).promise(),
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `user_${ordersUserId}`,
+                ':skPrefix': 'order_'
+              },
+              Limit: 100
+            }).promise()
+          ]);
+          
+          const ordersResult = {
+            Items: [...(newFormatOrders.Items || []), ...(oldFormatOrders.Items || [])]
+          };
+          
+          console.log(`Found ${ordersResult.Items?.length || 0} orders in DynamoDB`);
+          
+          // Transform DynamoDB items to frontend format
+          const orders = (ordersResult.Items || []).map(item => ({
+            id: item.orderId,
+            orderNumber: item.orderNumber,
+            customerName: item.customerEmail || 'Customer',
+            customerEmail: item.customerEmail,
+            total: parseFloat(item.totalPrice || 0),
+            currency: item.currency || 'USD',
+            status: item.status || 'pending',
+            fulfillmentStatus: item.fulfillmentStatus,
+            lineItems: item.lineItems || 0,
+            createdAt: item.createdAt,
+            storeDomain: item.storeDomain,
+            syncedAt: item.syncedAt
+          }));
+          
+          responseData = {
+            orders: orders,
+            count: orders.length,
+            source: 'dynamodb'
+          };
+        } catch (dbError) {
+          console.error('Error fetching orders from DynamoDB:', dbError);
+          // Fallback to mock data if DB fails
+          responseData = {
+            orders: [
+              { id: '1', customerName: 'John Doe', total: 299.99, status: 'completed' },
+              { id: '2', customerName: 'Jane Smith', total: 149.99, status: 'pending' }
+            ],
+            count: 2,
+            source: 'mock',
+            error: 'Failed to fetch from database'
+          };
+        }
+        break;
+        
+      case 'inventory':
+        // Extract userId from JWT token
+        const inventoryAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let inventoryUserId = await extractUserIdFromToken(inventoryAuthHeader);
+        
+        // Fallback to header if JWT extraction fails (for backward compatibility)
+        if (!inventoryUserId) {
+          inventoryUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!inventoryUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        // Handle POST method for updating inventory
+        if (method === 'POST') {
+          console.log('Updating inventory for user:', inventoryUserId);
+          
+          try {
+            // Parse request body
+            const requestBody = JSON.parse(event.body || '{}');
+            const inventoryStoreId = requestBody.storeId;
+            const inventorySku = requestBody.sku;
+            
+            if (!inventoryStoreId || !inventorySku) {
+              responseData = {
+                error: 'Store ID and SKU are required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Generate inventory ID
+            const inventoryId = `${inventorySku}_${requestBody.location || 'default'}`;
+            
+            // Create inventory item
+            const inventoryItem = {
+              pk: `USER#${inventoryUserId}`,
+              sk: `INVENTORY#${inventoryStoreId}#${inventoryId}`,
+              inventoryId: inventoryId,
+              sku: inventorySku,
+              productId: requestBody.productId || inventorySku,
+              location: requestBody.location || 'Warehouse A',
+              quantity: requestBody.quantity || 0,
+              available: requestBody.available !== undefined ? requestBody.available : requestBody.quantity || 0,
+              reserved: requestBody.reserved || 0,
+              incoming: requestBody.incoming || 0,
+              productName: requestBody.productName || '',
+              storeDomain: inventoryStoreId,
+              storeId: inventoryStoreId,
+              updatedAt: requestBody.updated_at || new Date().toISOString(),
+              syncedAt: new Date().toISOString(),
+              userId: inventoryUserId
+            };
+            
+            // Also update the product's inventory if it exists
+            if (requestBody.productId) {
+              await dynamodb.update({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  pk: `USER#${inventoryUserId}`,
+                  sk: `PRODUCT#${inventoryStoreId}#${requestBody.productId}`
+                },
+                UpdateExpression: 'SET inventory = :qty, updatedAt = :updated',
+                ExpressionAttributeValues: {
+                  ':qty': inventoryItem.quantity,
+                  ':updated': new Date().toISOString()
+                },
+                ConditionExpression: 'attribute_exists(pk)'
+              }).promise().catch(() => {
+                // Ignore if product doesn't exist
+                console.log('Product not found for inventory update, creating inventory record only');
+              });
+            }
+            
+            // Save inventory record to DynamoDB
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: inventoryItem
+            }).promise();
+            
+            console.log('Inventory updated successfully:', inventoryId);
+            
+            responseData = {
+              success: true,
+              inventory: {
+                id: inventoryId,
+                sku: inventorySku,
+                location: inventoryItem.location,
+                quantity: inventoryItem.quantity,
+                available: inventoryItem.available,
+                reserved: inventoryItem.reserved
+              }
+            };
+          } catch (error) {
+            console.error('Error updating inventory:', error);
+            responseData = {
+              success: false,
+              error: 'Failed to update inventory'
+            };
+            statusCode = 500;
+          }
+          break;
+        }
+        
+        // Handle GET method (existing code)
+        console.log('Fetching inventory for user:', inventoryUserId);
+        
+        try {
+          // Query DynamoDB for both product and inventory records
+          const [inventoryRecords, productRecords] = await Promise.all([
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${inventoryUserId}`,
+                ':skPrefix': 'INVENTORY#'
+              },
+              Limit: 100
+            }).promise(),
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${inventoryUserId}`,
+                ':skPrefix': 'PRODUCT#'
+              },
+              Limit: 100
+            }).promise()
+          ]);
+          
+          // Combine inventory records with product data
+          const inventoryMap = new Map();
+          
+          // Add inventory records
+          (inventoryRecords.Items || []).forEach(item => {
+            inventoryMap.set(item.sku, {
+              productId: item.productId,
+              variantId: item.variantId,
+              productName: item.productName,
+              sku: item.sku,
+              quantity: item.quantity || 0,
+              available: item.available || 0,
+              reserved: item.reserved || 0,
+              incoming: item.incoming || 0,
+              location: item.location || 'Main Store',
+              lastUpdated: item.updatedAt || item.syncedAt
+            });
+          });
+          
+          // Add/update with product data
+          (productRecords.Items || []).forEach(item => {
+            if (item.sku && !inventoryMap.has(item.sku)) {
+              inventoryMap.set(item.sku, {
+                productId: item.productId,
+                variantId: item.variantId,
+                productName: item.title,
+                sku: item.sku,
+                quantity: item.inventory || 0,
+                available: item.inventory || 0,
+                reserved: 0,
+                incoming: 0,
+                location: item.storeDomain || 'Main Store',
+                lastUpdated: item.syncedAt
+              });
+            }
+          });
+          
+          const inventory = Array.from(inventoryMap.values());
+          
+          responseData = {
+            inventory: inventory,
+            count: inventory.length,
+            totalItems: inventory.reduce((sum, item) => sum + item.quantity, 0),
+            source: 'dynamodb'
+          };
+        } catch (dbError) {
+          console.error('Error fetching inventory from DynamoDB:', dbError);
+          responseData = {
+            inventory: [
+              { productId: '1', quantity: 100, location: 'Warehouse A' },
+              { productId: '2', quantity: 50, location: 'Warehouse B' }
+            ],
+            count: 2,
+            source: 'mock'
+          };
+        }
+        break;
+        
+      case 'customers':
+        // Extract userId from JWT token
+        const customersAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let customersUserId = await extractUserIdFromToken(customersAuthHeader);
+        
+        // Fallback to header if JWT extraction fails (for backward compatibility)
+        if (!customersUserId) {
+          customersUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!customersUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        // Handle POST method for creating customers
+        if (method === 'POST') {
+          console.log('Creating new customer for user:', customersUserId);
+          
+          try {
+            // Parse request body
+            const requestBody = JSON.parse(event.body || '{}');
+            const customerStoreId = requestBody.storeId;
+            
+            if (!customerStoreId) {
+              responseData = {
+                error: 'Store ID is required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Generate customer ID
+            const customerId = requestBody.id || `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            
+            // Create customer item
+            const customerItem = {
+              pk: `USER#${customersUserId}`,
+              sk: `CUSTOMER#${customerStoreId}#${customerId}`,
+              customerId: customerId,
+              email: requestBody.email || '',
+              firstName: requestBody.first_name || requestBody.firstName || '',
+              lastName: requestBody.last_name || requestBody.lastName || '',
+              fullName: `${requestBody.first_name || ''} ${requestBody.last_name || ''}`.trim(),
+              phone: requestBody.phone || '',
+              address: requestBody.address || '',
+              city: requestBody.city || '',
+              state: requestBody.state || requestBody.province || '',
+              zip: requestBody.zip || requestBody.postal || '',
+              country: requestBody.country || 'United States',
+              tags: requestBody.tags || '',
+              notes: requestBody.notes || requestBody.note || '',
+              totalOrders: requestBody.totalOrders || 0,
+              totalSpent: requestBody.totalSpent || 0,
+              storeDomain: customerStoreId,
+              storeId: customerStoreId,
+              createdAt: requestBody.created_at || new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              syncedAt: new Date().toISOString(),
+              userId: customersUserId
+            };
+            
+            // Save to DynamoDB
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: customerItem
+            }).promise();
+            
+            console.log('Customer created successfully:', customerId);
+            
+            responseData = {
+              success: true,
+              customer: {
+                id: customerId,
+                email: customerItem.email,
+                name: customerItem.fullName,
+                phone: customerItem.phone
+              }
+            };
+          } catch (error) {
+            console.error('Error creating customer:', error);
+            responseData = {
+              success: false,
+              error: 'Failed to create customer'
+            };
+            statusCode = 500;
+          }
+          break;
+        }
+        
+        // Handle GET method
+        console.log('Fetching customers for user:', customersUserId);
+        
+        try {
+          // Query for actual customer records and metadata
+          const [customerRecords, customerMetadata] = await Promise.all([
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${customersUserId}`,
+                ':skPrefix': 'CUSTOMER#'
+              },
+              Limit: 100
+            }).promise(),
+            dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${customersUserId}`,
+                ':skPrefix': 'STORE#'
+              }
+            }).promise()
+          ]);
+          
+          const customers = (customerRecords.Items || []).map(item => ({
+            id: item.customerId,
+            email: item.email,
+            firstName: item.firstName,
+            lastName: item.lastName,
+            name: item.fullName,
+            phone: item.phone,
+            address: item.address,
+            city: item.city,
+            state: item.state,
+            zip: item.zip,
+            country: item.country,
+            tags: item.tags,
+            totalOrders: item.totalOrders || 0,
+            totalSpent: item.totalSpent || 0,
+            createdAt: item.createdAt,
+            storeDomain: item.storeDomain
+          }));
+          
+          // Get metadata for summary
+          const metadata = customerMetadata.Items?.[0];
+          const customerCount = customers.length || metadata?.customerCount || 0;
+          
+          responseData = {
+            customers: customers,
+            count: customers.length,
+            summary: {
+              totalCustomers: customerCount,
+              lastSyncedAt: metadata?.lastSyncedAt
+            },
+            source: customers.length > 0 ? 'dynamodb' : 'dynamodb-metadata',
+            note: customers.length === 0 ? 'Individual customer data not yet stored' : undefined
+          };
+        } catch (dbError) {
+          console.error('Error fetching customers from DynamoDB:', dbError);
+          // Return empty array in production - no mock data
+          responseData = {
+            customers: [],
+            count: 0,
+            source: 'error',
+            error: 'Failed to fetch from database'
+          };
+        }
+        break;
+        
+      case 'notifications':
+        responseData = {
+          notifications: [
+            { id: '1', type: 'info', message: 'System update completed' },
+            { id: '2', type: 'warning', message: 'Low inventory alert' }
+          ],
+          count: 2
+        };
+        break;
+        
+      case 'data':
+        // Handle data upload endpoint for CSV batch imports
+        // Extract userId from JWT token
+        const dataAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let dataUserId = await extractUserIdFromToken(dataAuthHeader);
+        
+        // Fallback to header if JWT extraction fails (for backward compatibility)
+        if (!dataUserId) {
+          dataUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!dataUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        // Only handle POST method for batch uploads
+        if (method !== 'POST' || !path.includes('/data/upload')) {
+          responseData = {
+            message: 'Data upload endpoint',
+            availableEndpoints: ['/api/data/upload'],
+            methods: ['POST']
+          };
+          break;
+        }
+        
+        console.log('Processing batch data upload for user:', dataUserId);
+        
+        try {
+          // Parse request body
+          const uploadRequest = JSON.parse(event.body || '{}');
+          const { storeId, dataType, csvContent, mappedColumns, records } = uploadRequest;
+          
+          // Validate required fields
+          if (!storeId) {
+            return {
+              statusCode: 400,
+              headers: corsHeaders,
+              body: JSON.stringify({ error: 'Store ID is required for data upload' })
+            };
+          }
+          
+          if (!dataType || !['products', 'orders', 'customers', 'inventory'].includes(dataType)) {
+            return {
+              statusCode: 400,
+              headers: corsHeaders,
+              body: JSON.stringify({ error: 'Valid data type required (products, orders, customers, inventory)' })
+            };
+          }
+          
+          // Parse CSV if provided as string
+          let dataRecords = records;
+          if (csvContent && !records) {
+            // Simple CSV parsing (frontend should send parsed data)
+            const lines = csvContent.split('\n');
+            const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+            dataRecords = lines.slice(1).filter(line => line.trim()).map(line => {
+              const values = line.split(',').map(v => v.trim().replace(/"/g, ''));
+              const record = {};
+              headers.forEach((header, i) => {
+                const mappedField = mappedColumns?.[header] || header;
+                record[mappedField] = values[i] || '';
+              });
+              return record;
+            });
+          }
+          
+          if (!dataRecords || dataRecords.length === 0) {
+            return {
+              statusCode: 400,
+              headers: corsHeaders,
+              body: JSON.stringify({ error: 'No data records to upload' })
+            };
+          }
+          
+          console.log(`Processing ${dataRecords.length} ${dataType} records for store ${storeId}`);
+          
+          // Process records based on data type
+          const results = {
+            success: 0,
+            failed: 0,
+            errors: []
+          };
+          
+          // Batch write items
+          const batchWrites = [];
+          const timestamp = new Date().toISOString();
+          
+          for (const record of dataRecords) {
+            try {
+              let item = {};
+              
+              switch (dataType) {
+                case 'products':
+                  const productId = record.id || record.sku || `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                  item = {
+                    pk: `USER#${dataUserId}`,
+                    sk: `PRODUCT#${storeId}#${productId}`,
+                    productId: productId,
+                    variantId: record.variantId || `variant_${productId}`,
+                    title: record.title || record.name || 'Untitled Product',
+                    name: record.title || record.name || 'Untitled Product',
+                    sku: record.sku || '',
+                    price: parseFloat(record.price) || 0,
+                    inventory: parseInt(record.inventory_quantity || record.inventory) || 0,
+                    vendor: record.vendor || '',
+                    product_type: record.product_type || '',
+                    description: record.description || '',
+                    tags: record.tags || '',
+                    storeDomain: storeId,
+                    storeId: storeId,
+                    createdAt: timestamp,
+                    updatedAt: timestamp,
+                    syncedAt: timestamp,
+                    userId: dataUserId
+                  };
+                  break;
+                  
+                case 'orders':
+                  const orderId = record.id || `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                  item = {
+                    pk: `USER#${dataUserId}`,
+                    sk: `ORDER#${storeId}#${orderId}`,
+                    orderId: orderId,
+                    orderNumber: record.name || record.orderNumber || `#${Math.floor(1000 + Math.random() * 9000)}`,
+                    customerEmail: record.email || record.customerEmail || '',
+                    customerName: record.billing_first_name && record.billing_last_name 
+                      ? `${record.billing_first_name} ${record.billing_last_name}`
+                      : record.customerName || record.email || 'Guest',
+                    totalPrice: parseFloat(record.total_price || record.total) || 0,
+                    currency: record.currency || 'USD',
+                    status: record.financial_status || record.status || 'pending',
+                    fulfillmentStatus: record.fulfillment_status || 'unfulfilled',
+                    lineItems: parseInt(record.lineItems) || 1,
+                    storeDomain: storeId,
+                    storeId: storeId,
+                    createdAt: record.created_at || timestamp,
+                    updatedAt: timestamp,
+                    syncedAt: timestamp,
+                    userId: dataUserId
+                  };
+                  break;
+                  
+                case 'customers':
+                  const customerId = record.id || record.email || `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                  item = {
+                    pk: `USER#${dataUserId}`,
+                    sk: `CUSTOMER#${storeId}#${customerId}`,
+                    customerId: customerId,
+                    email: record.email || '',
+                    firstName: record.first_name || record.firstName || '',
+                    lastName: record.last_name || record.lastName || '',
+                    fullName: `${record.first_name || ''} ${record.last_name || ''}`.trim() || 'Unknown',
+                    phone: record.phone || '',
+                    address: record.address || '',
+                    city: record.city || '',
+                    state: record.state || record.province || '',
+                    zip: record.zip || record.postal || '',
+                    country: record.country || 'United States',
+                    tags: record.tags || '',
+                    storeDomain: storeId,
+                    storeId: storeId,
+                    createdAt: record.created_at || timestamp,
+                    updatedAt: timestamp,
+                    syncedAt: timestamp,
+                    userId: dataUserId
+                  };
+                  break;
+                  
+                case 'inventory':
+                  const inventorySku = record.sku;
+                  if (!inventorySku) {
+                    throw new Error('SKU is required for inventory records');
+                  }
+                  const inventoryId = `${inventorySku}_${record.location || 'default'}`;
+                  item = {
+                    pk: `USER#${dataUserId}`,
+                    sk: `INVENTORY#${storeId}#${inventoryId}`,
+                    inventoryId: inventoryId,
+                    sku: inventorySku,
+                    productId: record.productId || inventorySku,
+                    location: record.location || 'Warehouse A',
+                    quantity: parseInt(record.quantity) || 0,
+                    available: parseInt(record.available !== undefined ? record.available : record.quantity) || 0,
+                    reserved: parseInt(record.reserved) || 0,
+                    incoming: parseInt(record.incoming) || 0,
+                    storeDomain: storeId,
+                    storeId: storeId,
+                    updatedAt: record.updated_at || timestamp,
+                    syncedAt: timestamp,
+                    userId: dataUserId
+                  };
+                  break;
+              }
+              
+              batchWrites.push({
+                PutRequest: {
+                  Item: item
+                }
+              });
+              
+              // DynamoDB batch write limit is 25 items
+              if (batchWrites.length === 25) {
+                await dynamodb.batchWrite({
+                  RequestItems: {
+                    [process.env.TABLE_NAME]: batchWrites.splice(0, 25)
+                  }
+                }).promise();
+              }
+              
+              results.success++;
+            } catch (recordError) {
+              console.error(`Error processing record:`, recordError);
+              results.failed++;
+              results.errors.push({
+                record: record.id || record.sku || record.email || 'unknown',
+                error: recordError.message
+              });
+            }
+          }
+          
+          // Write remaining items
+          if (batchWrites.length > 0) {
+            const chunks = [];
+            while (batchWrites.length > 0) {
+              chunks.push(batchWrites.splice(0, 25));
+            }
+            
+            for (const chunk of chunks) {
+              await dynamodb.batchWrite({
+                RequestItems: {
+                  [process.env.TABLE_NAME]: chunk
+                }
+              }).promise();
+            }
+          }
+          
+          // Update store metadata with upload info
+          await dynamodb.update({
+            TableName: process.env.TABLE_NAME,
+            Key: {
+              pk: `USER#${dataUserId}`,
+              sk: `STORE#${storeId}_metadata`
+            },
+            UpdateExpression: 'SET lastUploadAt = :timestamp, lastUploadType = :dataType, #uploadCount = if_not_exists(#uploadCount, :zero) + :one',
+            ExpressionAttributeNames: {
+              '#uploadCount': 'uploadCount'
+            },
+            ExpressionAttributeValues: {
+              ':timestamp': timestamp,
+              ':dataType': dataType,
+              ':zero': 0,
+              ':one': 1
+            }
+          }).promise().catch(err => {
+            console.log('Could not update store metadata:', err);
+          });
+          
+          console.log(`Upload complete: ${results.success} succeeded, ${results.failed} failed`);
+          
+          responseData = {
+            success: true,
+            message: `Successfully uploaded ${results.success} ${dataType} records`,
+            results: {
+              dataType: dataType,
+              storeId: storeId,
+              totalRecords: dataRecords.length,
+              successful: results.success,
+              failed: results.failed,
+              errors: results.errors.slice(0, 10) // Limit error details
+            }
+          };
+        } catch (error) {
+          console.error('Error processing batch upload:', error);
+          responseData = {
+            success: false,
+            error: 'Failed to process batch upload',
+            details: error.message
+          };
+          statusCode = 500;
+        }
+        break;
+        
+      case 'config':
+        // Return application configuration
+        responseData = {
+          environment: process.env.ENVIRONMENT || 'production',
+          apiUrl: `https://${event.requestContext?.domainName || event.headers?.host}/${event.requestContext?.stage || 'production'}`,
+          region: process.env.AWS_REGION || 'us-west-1',
+          userPoolId: process.env.USER_POOL_ID,
+          clientId: process.env.USER_POOL_CLIENT_ID,
+          features: {
+            enableDebug: false,
+            enableAnalytics: true,
+            enableMockData: false,
+            useWebCrypto: true
+          }
+        };
+        break;
+        
+      case 'preferences':
+        // Handle user preferences (column visibility, display settings, etc.)
+        const prefsAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let prefsUserId = await extractUserIdFromToken(prefsAuthHeader);
+        
+        // Fallback to header if JWT extraction fails
+        if (!prefsUserId) {
+          prefsUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!prefsUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        if (method === 'GET') {
+          // Retrieve user preferences
+          console.log('Getting preferences for user:', prefsUserId);
+          
+          try {
+            const result = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES'
+              }
+            }).promise();
+            
+            responseData = {
+              preferences: result.Item?.preferences || {
+                columnVisibility: {},
+                displaySettings: {},
+                notifications: {},
+                theme: 'light'
+              }
+            };
+          } catch (error) {
+            console.error('Error getting preferences:', error);
+            responseData = {
+              preferences: {
+                columnVisibility: {},
+                displaySettings: {},
+                notifications: {},
+                theme: 'light'
+              }
+            };
+          }
+        } else if (method === 'PUT' || method === 'POST') {
+          // Update user preferences
+          console.log('Updating preferences for user:', prefsUserId);
+          
+          try {
+            const requestBody = JSON.parse(event.body || '{}');
+            const { preferences } = requestBody;
+            
+            if (!preferences) {
+              responseData = {
+                error: 'Preferences object required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Store preferences with timestamp
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES',
+                preferences: preferences,
+                updatedAt: new Date().toISOString(),
+                userId: prefsUserId
+              }
+            }).promise();
+            
+            responseData = {
+              success: true,
+              message: 'Preferences updated successfully',
+              preferences: preferences
+            };
+          } catch (error) {
+            console.error('Error updating preferences:', error);
+            responseData = {
+              error: 'Failed to update preferences'
+            };
+            statusCode = 500;
+          }
+        } else if (method === 'PATCH') {
+          // Partial update of preferences (merge with existing)
+          console.log('Partially updating preferences for user:', prefsUserId);
+          
+          try {
+            const requestBody = JSON.parse(event.body || '{}');
+            const updates = requestBody.preferences || requestBody;
+            
+            // Get existing preferences
+            const existing = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES'
+              }
+            }).promise();
+            
+            // Merge preferences
+            const mergedPreferences = {
+              ...(existing.Item?.preferences || {}),
+              ...updates,
+              // Deep merge for nested objects
+              columnVisibility: {
+                ...(existing.Item?.preferences?.columnVisibility || {}),
+                ...(updates.columnVisibility || {})
+              },
+              displaySettings: {
+                ...(existing.Item?.preferences?.displaySettings || {}),
+                ...(updates.displaySettings || {})
+              },
+              notifications: {
+                ...(existing.Item?.preferences?.notifications || {}),
+                ...(updates.notifications || {})
+              }
+            };
+            
+            // Store merged preferences
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES',
+                preferences: mergedPreferences,
+                updatedAt: new Date().toISOString(),
+                userId: prefsUserId
+              }
+            }).promise();
+            
+            responseData = {
+              success: true,
+              message: 'Preferences updated successfully',
+              preferences: mergedPreferences
+            };
+          } catch (error) {
+            console.error('Error updating preferences:', error);
+            responseData = {
+              error: 'Failed to update preferences'
+            };
+            statusCode = 500;
+          }
+        } else {
+          responseData = {
+            error: `Method ${method} not allowed for preferences`
+          };
+          statusCode = 405;
+        }
+        break;
+        
+      case 'stores':
+        // Extract userId from JWT token
+        const storesAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let storesUserId = await extractUserIdFromToken(storesAuthHeader);
+        
+        // Fallback to header if JWT extraction fails (for backward compatibility)
+        if (!storesUserId) {
+          storesUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!storesUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        // Handle POST method for creating stores
+        if (method === 'POST') {
+          console.log('Creating new store for user:', storesUserId);
+          
+          try {
+            // Parse request body
+            const requestBody = JSON.parse(event.body || '{}');
+            
+            // Validate required fields
+            if (!requestBody.name) {
+              responseData = {
+                error: 'Store name is required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Generate store ID
+            const storeId = requestBody.id || `${requestBody.type || 'manual'}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            
+            // Create store item
+            const storeItem = {
+              pk: `USER#${storesUserId}`,
+              sk: `STORE#${storeId}_metadata`,
+              storeId: storeId,
+              storeName: requestBody.name,
+              name: requestBody.name,
+              displayName: requestBody.name,
+              storeType: requestBody.type || 'brick-and-mortar',
+              type: requestBody.type || 'brick-and-mortar',
+              address: requestBody.address || '',
+              city: requestBody.city || '',
+              state: requestBody.state || '',
+              zipCode: requestBody.zipCode || '',
+              country: requestBody.country || 'United States',
+              website: requestBody.website || '',
+              shopifyDomain: requestBody.shopifyDomain || '',
+              apiKey: requestBody.apiKey || '',
+              status: requestBody.status || 'active',
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              userId: storesUserId
+            };
+            
+            // Save to DynamoDB
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: storeItem
+            }).promise();
+            
+            console.log('Store created successfully:', storeId);
+            
+            // Return the created store
+            responseData = {
+              success: true,
+              store: {
+                id: storeId,
+                name: storeItem.storeName,
+                displayName: storeItem.displayName,
+                type: storeItem.storeType,
+                address: storeItem.address,
+                city: storeItem.city,
+                state: storeItem.state,
+                zipCode: storeItem.zipCode,
+                country: storeItem.country,
+                website: storeItem.website,
+                shopifyDomain: storeItem.shopifyDomain,
+                status: storeItem.status,
+                createdAt: storeItem.createdAt
+              }
+            };
+            statusCode = 201;
+            
+          } catch (error) {
+            console.error('Error creating store:', error);
+            responseData = {
+              error: 'Failed to create store',
+              details: error.message
+            };
+            statusCode = 500;
+          }
+        }
+        // Handle PUT method for updating stores
+        else if (method === 'PUT') {
+          const storeId = event.pathParameters?.id || event.queryStringParameters?.storeId;
+          
+          if (!storeId) {
+            responseData = {
+              error: 'Store ID is required for update'
+            };
+            statusCode = 400;
+            break;
+          }
+          
+          console.log('Updating store:', storeId, 'for user:', storesUserId);
+          
+          try {
+            // Parse request body
+            const requestBody = JSON.parse(event.body || '{}');
+            
+            // Update store item
+            const updateExpression = [];
+            const expressionAttributeNames = {};
+            const expressionAttributeValues = {};
+            
+            // Build update expression dynamically
+            const updateableFields = [
+              'name', 'displayName', 'type', 'address', 'city', 'state', 
+              'zipCode', 'country', 'website', 'shopifyDomain', 'apiKey', 'status'
+            ];
+            
+            updateableFields.forEach(field => {
+              if (requestBody[field] !== undefined) {
+                const placeholder = `#${field}`;
+                const valuePlaceholder = `:${field}`;
+                updateExpression.push(`${placeholder} = ${valuePlaceholder}`);
+                expressionAttributeNames[placeholder] = field;
+                expressionAttributeValues[valuePlaceholder] = requestBody[field];
+              }
+            });
+            
+            // Always update the updatedAt timestamp
+            updateExpression.push('#updatedAt = :updatedAt');
+            expressionAttributeNames['#updatedAt'] = 'updatedAt';
+            expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+            
+            // Update in DynamoDB
+            await dynamodb.update({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${storesUserId}`,
+                sk: `STORE#${storeId}_metadata`
+              },
+              UpdateExpression: `SET ${updateExpression.join(', ')}`,
+              ExpressionAttributeNames: expressionAttributeNames,
+              ExpressionAttributeValues: expressionAttributeValues
+            }).promise();
+            
+            console.log('Store updated successfully:', storeId);
+            
+            // Return success response
+            responseData = {
+              success: true,
+              store: {
+                id: storeId,
+                ...requestBody,
+                updatedAt: expressionAttributeValues[':updatedAt']
+              }
+            };
+            statusCode = 200;
+            
+          } catch (error) {
+            console.error('Error updating store:', error);
+            responseData = {
+              error: 'Failed to update store',
+              details: error.message
+            };
+            statusCode = 500;
+          }
+        }
+        // Handle DELETE method with confirmation
+        else if (method === 'DELETE') {
+          // Extract store ID from path
+          const pathStr = path || event.rawPath || '';
+          const storeId = pathParts[2] || event.pathParameters?.id || event.queryStringParameters?.storeId;
+          
+          if (!storeId) {
+            responseData = {
+              error: 'Store ID is required for deletion'
+            };
+            statusCode = 400;
+            break;
+          }
+          
+          // Simple deletion without confirmation code for better UX
+          // Security is enforced by ensuring the user owns the store
+          console.log('Deleting store:', storeId, 'for user:', storesUserId);
+          
+          try {
+            // First, verify the store exists and belongs to the user (NEW FORMAT ONLY)
+            const storeCheck = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${storesUserId}`,
+                sk: `STORE#${storeId}_metadata`
+              }
+            }).promise();
+            
+            if (!storeCheck.Item) {
+              responseData = {
+                error: 'Store not found or you do not have permission to delete it'
+              };
+              statusCode = 404;
+              break;
+            }
+            
+            // Store found and belongs to user, proceed with deletion
+            const deletedStore = storeCheck.Item || {};
+            
+            // Delete the store metadata (NEW FORMAT ONLY)
+            await dynamodb.delete({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${storesUserId}`,
+                sk: `STORE#${storeId}_metadata`
+              },
+              ReturnValues: 'ALL_OLD'
+            }).promise();
+            
+            console.log('Store deleted successfully:', storeId);
+            
+            // Return success response with cache invalidation flag
+            responseData = {
+              success: true,
+              message: `Store "${deletedStore.name || storeId}" has been deleted successfully`,
+              deletedStore: {
+                id: storeId,
+                name: deletedStore.name || deletedStore.storeName,
+                platform: deletedStore.platform || deletedStore.storeType || 'manual'
+                // Don't return sensitive data like access tokens
+              },
+              clearCache: true,
+              cacheKey: `stores_${storesUserId}`
+            };
+            statusCode = 200;
+            
+          } catch (error) {
+            console.error('Error deleting store:', error);
+            responseData = {
+              error: 'Failed to delete store',
+              details: error.message
+            };
+            statusCode = 500;
+          }
+        }
+        // OLD CONFIRMATION CODE FLOW (keeping for reference but not used)
+        else if (false && method === 'DELETE') {
+          // Check if this is a request for deletion code or actual deletion
+          const pathStr = path || event.rawPath || '';
+          const isRequestingCode = pathStr.includes('/request-deletion');
+          const storeId = pathParts[2] || event.pathParameters?.id || event.queryStringParameters?.storeId;
+          
+          const requestBody = JSON.parse(event.body || '{}');
+          
+          // Handle request for deletion confirmation code
+          if (isRequestingCode || method === 'POST' && pathStr.includes('/request-deletion')) {
+            console.log('Requesting deletion confirmation code for store:', storeId);
+            
+            try {
+              // Generate a 6-digit confirmation code
+              const confirmationCode = Math.floor(100000 + Math.random() * 900000).toString();
+              
+              // Store the confirmation code in DynamoDB with TTL (expires in 15 minutes)
+              await dynamodb.put({
+                TableName: process.env.TABLE_NAME,
+                Item: {
+                  pk: `deletion_confirmation_${storesUserId}`,
+                  sk: `store_${storeId}`,
+                  confirmationCode: confirmationCode,
+                  storeId: storeId,
+                  userId: storesUserId,
+                  createdAt: new Date().toISOString(),
+                  ttl: Math.floor(Date.now() / 1000) + 900 // Expires in 15 minutes
+                }
+              }).promise();
+              
+              // Send confirmation code via email (using SES) or SMS
+              if (requestBody.email || requestBody.method === 'email') {
+                try {
+                  const ses = new AWS.SES();
+                  await ses.sendEmail({
+                    Destination: {
+                      ToAddresses: [requestBody.email || user?.email || 'user@example.com']
+                    },
+                    Message: {
+                      Body: {
+                        Html: {
+                          Data: `
+                            <h2>Store Deletion Confirmation</h2>
+                            <p>You have requested to delete the store: <strong>${storeId}</strong></p>
+                            <p>This action will permanently delete:</p>
+                            <ul>
+                              <li>The store configuration</li>
+                              <li>All products and inventory data</li>
+                              <li>All order history</li>
+                              <li>All customer records</li>
+                              <li>All analytics and forecasts</li>
+                            </ul>
+                            <p><strong>This action cannot be undone!</strong></p>
+                            <p>Your confirmation code is: <h1 style="color: red; font-family: monospace;">${confirmationCode}</h1></p>
+                            <p>This code will expire in 15 minutes.</p>
+                            <p>If you did not request this deletion, please ignore this email and secure your account.</p>
+                          `
+                        },
+                        Text: {
+                          Data: `Store Deletion Confirmation\n\nConfirmation Code: ${confirmationCode}\n\nThis will delete store ${storeId} and ALL associated data. This action cannot be undone.\n\nCode expires in 15 minutes.`
+                        }
+                      },
+                      Subject: {
+                        Data: `⚠️ Store Deletion Confirmation Code: ${confirmationCode}`
+                      }
+                    },
+                    Source: 'no-reply@ordernimbus.com'
+                  }).promise();
+                } catch (emailError) {
+                  console.error('Error sending confirmation email:', emailError);
+                  // Continue anyway, code is stored
+                }
+              }
+              
+              responseData = {
+                success: true,
+                message: 'Confirmation code sent. Please check your email.',
+                expiresIn: 900 // seconds
+              };
+            } catch (error) {
+              console.error('Error generating confirmation code:', error);
+              responseData = {
+                error: 'Failed to generate confirmation code'
+              };
+              statusCode = 500;
+            }
+          }
+          // Handle actual deletion with confirmation
+          else {
+            console.log('Attempting to delete store:', storeId, 'for user:', storesUserId);
+            
+            // Check for confirmation code
+            if (!requestBody.confirmationCode) {
+              responseData = {
+                error: 'Confirmation code required. Please request a deletion code first.',
+                requiresConfirmation: true
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            try {
+              // Verify confirmation code
+              const confirmationResult = await dynamodb.get({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  pk: `deletion_confirmation_${storesUserId}`,
+                  sk: `store_${storeId}`
+                }
+              }).promise();
+              
+              if (!confirmationResult.Item || 
+                  confirmationResult.Item.confirmationCode !== requestBody.confirmationCode) {
+                responseData = {
+                  error: 'Invalid confirmation code',
+                  remainingAttempts: 2 // Track attempts to prevent brute force
+                };
+                statusCode = 403;
+                break;
+              }
+              
+              // Confirmation successful, proceed with deletion
+              console.log('Confirmation verified, proceeding with cascade delete');
+              
+              // Track what we're deleting
+              const deletedItems = {
+                store: 0,
+                products: 0,
+                orders: 0,
+                inventory: 0,
+                customers: 0,
+                total: 0
+              };
+              
+              // Delete store metadata first
+              try {
+                await dynamodb.delete({
+                  TableName: process.env.TABLE_NAME,
+                  Key: {
+                    pk: `USER#${storesUserId}`,
+                    sk: `STORE#${storeId}_metadata`
+                  }
+                }).promise();
+                deletedItems.store = 1;
+              } catch (e) {
+                console.log('Store metadata not found in new format, trying old format');
+                await dynamodb.delete({
+                  TableName: process.env.TABLE_NAME,
+                  Key: {
+                    pk: `user_${storesUserId}`,
+                    sk: `store_${storeId}_metadata`
+                  }
+                }).promise();
+                deletedItems.store = 1;
+              }
+              
+              // Query and delete all associated data
+              const dataTypes = [
+                { prefix: 'PRODUCT#', key: 'products' },
+                { prefix: 'ORDER#', key: 'orders' },
+                { prefix: 'INVENTORY#', key: 'inventory' },
+                { prefix: 'CUSTOMER#', key: 'customers' }
+              ];
+              
+              for (const dataType of dataTypes) {
+                try {
+                  // Query for items of this type for this store
+                  const items = await dynamodb.query({
+                    TableName: process.env.TABLE_NAME,
+                    KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+                    ExpressionAttributeValues: {
+                      ':pk': `USER#${storesUserId}`,
+                      ':skPrefix': `${dataType.prefix}${storeId}#`
+                    }
+                  }).promise();
+                  
+                  if (items.Items && items.Items.length > 0) {
+                    // Batch delete for efficiency
+                    const batchSize = 25; // DynamoDB batch write limit
+                    for (let i = 0; i < items.Items.length; i += batchSize) {
+                      const batch = items.Items.slice(i, i + batchSize);
+                      const deleteRequests = batch.map(item => ({
+                        DeleteRequest: {
+                          Key: {
+                            pk: item.pk,
+                            sk: item.sk
+                          }
+                        }
+                      }));
+                      
+                      await dynamodb.batchWrite({
+                        RequestItems: {
+                          [process.env.TABLE_NAME]: deleteRequests
+                        }
+                      }).promise();
+                      
+                      deletedItems[dataType.key] += batch.length;
+                    }
+                  }
+                } catch (queryError) {
+                  console.error(`Error deleting ${dataType.key}:`, queryError);
+                }
+              }
+              
+              // If this is a Shopify store, also delete OAuth tokens
+              if (storeId.startsWith('shopify_')) {
+                try {
+                  // Find and delete Shopify OAuth token
+                  const shopifyDomain = requestBody.shopifyDomain || storeId;
+                  await dynamodb.delete({
+                    TableName: process.env.TABLE_NAME,
+                    Key: {
+                      pk: `store_${shopifyDomain}`,
+                      sk: `user_${storesUserId}`
+                    }
+                  }).promise();
+                  console.log('Deleted Shopify OAuth token');
+                } catch (e) {
+                  console.log('No Shopify OAuth token found');
+                }
+              }
+              
+              // Delete the confirmation code
+              await dynamodb.delete({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  pk: `deletion_confirmation_${storesUserId}`,
+                  sk: `store_${storeId}`
+                }
+              }).promise();
+              
+              deletedItems.total = Object.values(deletedItems).reduce((a, b) => a + b, 0);
+              
+              console.log('Store deletion completed:', deletedItems);
+              
+              responseData = {
+                success: true,
+                message: `Store ${storeId} and all associated data deleted successfully`,
+                deletedItems: deletedItems,
+                shopifyDisconnected: storeId.startsWith('shopify_')
+              };
+              
+            } catch (error) {
+              console.error('Error during store deletion:', error);
+              responseData = {
+                error: 'Failed to delete store',
+                details: error.message
+              };
+              statusCode = 500;
+            }
+          }
+        } else {
+          // Handle GET method (default)
+          console.log('Fetching stores for user:', storesUserId);
+          
+          try {
+            // Query DynamoDB for user's stores (NEW FORMAT ONLY)
+            const storesResult = await dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${storesUserId}`,
+                ':skPrefix': 'STORE#'
+              }
+            }).promise();
+            
+            console.log(`Found ${storesResult.Items?.length || 0} stores in DynamoDB`);
+            
+            // Transform DynamoDB items to store format
+            const stores = (storesResult.Items || []).map(item => {
+              // NEW FORMAT ONLY: STORE#storeId_metadata
+              // The storeId should always be present in the item
+              const storeId = item.storeId || item.sk.replace('STORE#', '').replace('_metadata', '');
+              
+              return {
+                id: storeId,
+                name: item.storeName || item.name || item.displayName || 'Unnamed Store',
+                displayName: item.displayName || item.storeName || item.name || 'Unnamed Store',
+                type: item.storeType || item.type || 'brick-and-mortar',
+                shopifyDomain: item.shopifyDomain || '',
+                address: item.address || '',
+                city: item.city || '',
+                state: item.state || '',
+                zipCode: item.zipCode || '',
+                country: item.country || 'United States',
+                website: item.website || '',
+                status: item.status || 'active',
+                syncStatus: item.syncStatus || 'not_connected',
+                syncMetadata: item.syncMetadata,
+                connectedAt: item.connectedAt,
+                lastSyncAt: item.lastSyncAt,
+                productsCount: item.productsCount || 0,
+                ordersCount: item.ordersCount || 0,
+                createdAt: item.createdAt,
+                updatedAt: item.updatedAt
+              };
+            });
+            
+            responseData = {
+              stores: stores,
+              count: stores.length,
+              source: 'dynamodb'
+            };
+          } catch (dbError) {
+            console.error('Error fetching stores from DynamoDB:', dbError);
+            // Return empty array instead of mock data in production
+            responseData = {
+              stores: [],
+              count: 0,
+              source: 'error',
+              error: 'Failed to fetch stores'
+            };
+          }
+        }
+        break;
+        
+      case 'shopify':
+        // Handle Shopify OAuth integration
+        if (path.includes('/shopify/connect')) {
+          try {
+            const body = JSON.parse(event.body || '{}');
+            const { storeDomain, userId } = body;
+            
+            if (!storeDomain) {
+              return {
+                statusCode: 400,
+                headers: corsHeaders,
+                body: JSON.stringify({ error: 'Store domain is required' })
+              };
+            }
+            
+            // Get Shopify credentials from Secrets Manager
+            const credentials = await getShopifyCredentials();
+            
+            if (!credentials.SHOPIFY_CLIENT_ID) {
+              console.error('Shopify credentials not found in Secrets Manager');
+              return {
+                statusCode: 500,
+                headers: corsHeaders,
+                body: JSON.stringify({ error: 'Shopify integration not configured' })
+              };
+            }
+            
+            const SHOPIFY_CLIENT_ID = credentials.SHOPIFY_CLIENT_ID;
+            
+            // Get dynamic API Gateway URL from request context
+            const domainName = event.requestContext?.domainName || event.headers?.Host || event.headers?.host;
+            const stage = event.requestContext?.stage || 'production';
+            
+            // Build the API Gateway URL dynamically
+            const API_GATEWAY_URL = domainName 
+              ? `https://${domainName}/${stage}`
+              : `https://${process.env.API_GATEWAY_URL || 'tvaog6ef2f.execute-api.us-west-1.amazonaws.com/production'}`;
+            
+            const REDIRECT_URI = `${API_GATEWAY_URL}/api/shopify/callback`;
+            
+            console.log('Dynamic API Gateway URL:', API_GATEWAY_URL);
+            console.log('Redirect URI:', REDIRECT_URI);
+            const SCOPES = 'read_products,read_orders,read_inventory,read_customers,read_analytics';
+            
+            // Clean domain
+            const cleanDomain = storeDomain.replace(/^https?:\/\//, '').replace(/\/$/, '').replace(/\.myshopify\.com.*$/, '') + '.myshopify.com';
+            
+            // Generate random state for CSRF protection
+            const state = Math.random().toString(36).substring(7);
+            
+            // Store state in DynamoDB for verification
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `oauth_state_${state}`,
+                sk: 'shopify',
+                userId: userId || 'unknown',
+                storeDomain: cleanDomain,
+                createdAt: new Date().toISOString(),
+                ttl: Math.floor(Date.now() / 1000) + 600 // Expire in 10 minutes
+              }
+            }).promise();
+            
+            const authUrl = `https://${cleanDomain}/admin/oauth/authorize?` +
+              `client_id=${SHOPIFY_CLIENT_ID}&` +
+              `scope=${SCOPES}&` +
+              `redirect_uri=${encodeURIComponent(REDIRECT_URI)}&` +
+              `state=${state}`;
+            
+            responseData = {
+              authUrl: authUrl,
+              message: 'Redirect user to Shopify OAuth'
+            };
+          } catch (error) {
+            console.error('Error in Shopify connect:', error);
+            return {
+              statusCode: 500,
+              headers: corsHeaders,
+              body: JSON.stringify({ error: 'Failed to initiate Shopify connection' })
+            };
+          }
+        } else if (path.includes('/shopify/callback')) {
+          // Handle OAuth callback
+          const queryParams = event.queryStringParameters || {};
+          const { code, state, shop } = queryParams;
+          
+          if (!code || !state || !shop) {
+            return {
+              statusCode: 400,
+              headers: { 'Content-Type': 'text/html' },
+              body: '<html><body><h2>Error: Missing required parameters</h2><script>setTimeout(() => window.close(), 3000);</script></body></html>'
+            };
+          }
+          
+          try {
+            // Verify state from DynamoDB
+            const stateResult = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `oauth_state_${state}`,
+                sk: 'shopify'
+              }
+            }).promise();
+            
+            if (!stateResult.Item) {
+              throw new Error('Invalid state parameter');
+            }
+            
+            // Get Shopify credentials
+            const credentials = await getShopifyCredentials();
+            
+            // Exchange code for access token
+            const tokenData = querystring.stringify({
+              client_id: credentials.SHOPIFY_CLIENT_ID,
+              client_secret: credentials.SHOPIFY_CLIENT_SECRET,
+              code: code
+            });
+            
+            // Make HTTPS request to get access token
+            const accessToken = await new Promise((resolve, reject) => {
+              const options = {
+                hostname: shop,
+                path: '/admin/oauth/access_token',
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'Content-Length': Buffer.byteLength(tokenData)
+                }
+              };
+              
+              const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                  try {
+                    const result = JSON.parse(data);
+                    resolve(result.access_token);
+                  } catch (e) {
+                    reject(e);
+                  }
+                });
+              });
+              
+              req.on('error', reject);
+              req.write(tokenData);
+              req.end();
+            });
+            
+            // Store the access token in DynamoDB
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `store_${shop}`,
+                sk: `user_${stateResult.Item.userId}`,
+                accessToken: accessToken,
+                storeDomain: shop,
+                connectedAt: new Date().toISOString()
+              }
+            }).promise();
+            
+            // Also create a store record in the user's namespace
+            const storeId = `shopify_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            
+            // Fetch store details from Shopify
+            let storeDetails = {};
+            try {
+              storeDetails = await makeShopifyRequest(shop, accessToken, '/shop.json', 'GET');
+              console.log('Fetched store details from Shopify:', storeDetails);
+            } catch (error) {
+              console.error('Error fetching store details:', error);
+            }
+            
+            // Create store record for the user
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `USER#${stateResult.Item.userId}`,
+                sk: `STORE#${storeId}_metadata`,
+                storeId: storeId,
+                storeName: storeDetails.shop?.name || shop.replace('.myshopify.com', ''),
+                name: storeDetails.shop?.name || shop.replace('.myshopify.com', ''),
+                displayName: storeDetails.shop?.name || shop.replace('.myshopify.com', ''),
+                storeType: 'shopify',
+                type: 'shopify',
+                shopifyDomain: shop,
+                email: storeDetails.shop?.email || '',
+                phone: storeDetails.shop?.phone || '',
+                address: storeDetails.shop?.address1 || '',
+                city: storeDetails.shop?.city || '',
+                state: storeDetails.shop?.province || '',
+                zipCode: storeDetails.shop?.zip || '',
+                country: storeDetails.shop?.country || 'United States',
+                website: storeDetails.shop?.domain || `https://${shop}`,
+                currency: storeDetails.shop?.currency || 'USD',
+                status: 'active',
+                connectedAt: new Date().toISOString(),
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                userId: stateResult.Item.userId
+              }
+            }).promise();
+            
+            console.log('Store record created for user:', stateResult.Item.userId);
+            
+            // Trigger initial sync of products, orders, and inventory
+            let syncResults = {
+              products: 0,
+              orders: 0,
+              inventory: 0
+            };
+            
+            try {
+              // Fetch and store products
+              const productsData = await makeShopifyRequest(shop, accessToken, '/products.json?limit=250', 'GET');
+              if (productsData.products) {
+                for (const product of productsData.products) {
+                  for (const variant of (product.variants || [])) {
+                    await dynamodb.put({
+                      TableName: process.env.TABLE_NAME,
+                      Item: {
+                        pk: `USER#${stateResult.Item.userId}`,
+                        sk: `PRODUCT#${storeId}#${product.id}_${variant.id}`,
+                        productId: product.id.toString(),
+                        variantId: variant.id.toString(),
+                        title: product.title,
+                        name: product.title,
+                        variantTitle: variant.title || 'Default',
+                        sku: variant.sku || '',
+                        price: parseFloat(variant.price) || 0,
+                        inventory: variant.inventory_quantity || 0,
+                        vendor: product.vendor || '',
+                        product_type: product.product_type || '',
+                        tags: product.tags || '',
+                        storeDomain: shop,
+                        storeId: storeId,
+                        createdAt: product.created_at,
+                        updatedAt: product.updated_at,
+                        syncedAt: new Date().toISOString(),
+                        userId: stateResult.Item.userId
+                      }
+                    }).promise();
+                    syncResults.products++;
+                  }
+                }
+              }
+              
+              // Fetch and store recent orders
+              const ordersData = await makeShopifyRequest(shop, accessToken, '/orders.json?limit=250&status=any', 'GET');
+              if (ordersData.orders) {
+                for (const order of ordersData.orders) {
+                  await dynamodb.put({
+                    TableName: process.env.TABLE_NAME,
+                    Item: {
+                      pk: `USER#${stateResult.Item.userId}`,
+                      sk: `ORDER#${storeId}#${order.id}`,
+                      orderId: order.id.toString(),
+                      orderNumber: order.order_number,
+                      customerId: order.customer?.id?.toString() || 'guest',
+                      customerName: order.customer ? `${order.customer.first_name} ${order.customer.last_name}` : 'Guest',
+                      totalPrice: parseFloat(order.total_price) || 0,
+                      subtotal: parseFloat(order.subtotal_price) || 0,
+                      totalTax: parseFloat(order.total_tax) || 0,
+                      currency: order.currency,
+                      financialStatus: order.financial_status,
+                      fulfillmentStatus: order.fulfillment_status,
+                      orderDate: order.created_at,
+                      itemCount: order.line_items?.length || 0,
+                      storeDomain: shop,
+                      storeId: storeId,
+                      syncedAt: new Date().toISOString(),
+                      userId: stateResult.Item.userId
+                    }
+                  }).promise();
+                  syncResults.orders++;
+                }
+              }
+              
+              // Fetch and store inventory levels
+              const locationsData = await makeShopifyRequest(shop, accessToken, '/locations.json', 'GET');
+              if (locationsData.locations && locationsData.locations.length > 0) {
+                const locationId = locationsData.locations[0].id;
+                const inventoryData = await makeShopifyRequest(shop, accessToken, `/inventory_levels.json?location_ids=${locationId}&limit=250`, 'GET');
+                if (inventoryData.inventory_levels) {
+                  for (const item of inventoryData.inventory_levels) {
+                    await dynamodb.put({
+                      TableName: process.env.TABLE_NAME,
+                      Item: {
+                        pk: `USER#${stateResult.Item.userId}`,
+                        sk: `INVENTORY#${storeId}#${item.inventory_item_id}`,
+                        inventoryId: item.inventory_item_id.toString(),
+                        location: locationsData.locations[0].name,
+                        quantity: item.available || 0,
+                        available: item.available || 0,
+                        storeDomain: shop,
+                        storeId: storeId,
+                        updatedAt: item.updated_at || new Date().toISOString(),
+                        syncedAt: new Date().toISOString(),
+                        userId: stateResult.Item.userId
+                      }
+                    }).promise();
+                    syncResults.inventory++;
+                  }
+                }
+              }
+              
+              console.log('Initial sync completed:', syncResults);
+              
+            } catch (syncError) {
+              console.error('Error during initial sync:', syncError);
+            }
+            
+            // Delete the state token
+            await dynamodb.delete({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `oauth_state_${state}`,
+                sk: 'shopify'
+              }
+            }).promise();
+            
+            // Return success HTML that closes the popup and sends store info
+            return {
+              statusCode: 200,
+              headers: { 'Content-Type': 'text/html' },
+              body: `<html><body>
+                <h2>✅ Successfully connected to Shopify!</h2>
+                <p>Imported ${syncResults.products} products, ${syncResults.orders} orders, ${syncResults.inventory} inventory items</p>
+                <p>This window will close automatically...</p>
+                <script>
+                  if (window.opener) {
+                    window.opener.postMessage({ 
+                      type: 'shopify-connected', 
+                      success: true,
+                      storeData: {
+                        storeDomain: '${shop}',
+                        storeId: '${storeId}',
+                        userId: '${stateResult.Item.userId}',
+                        storeName: '${storeDetails.shop?.name || shop.replace('.myshopify.com', '')}',
+                        connectedAt: '${new Date().toISOString()}',
+                        syncResults: {
+                          products: ${syncResults.products},
+                          orders: ${syncResults.orders},
+                          inventory: ${syncResults.inventory}
+                        }
+                      }
+                    }, '*');
+                  }
+                  setTimeout(() => window.close(), 2000);
+                </script>
+              </body></html>`
+            };
+          } catch (error) {
+            console.error('Error in Shopify callback:', error);
+            return {
+              statusCode: 500,
+              headers: { 'Content-Type': 'text/html' },
+              body: `<html><body>
+                <h2>❌ Connection failed</h2>
+                <p>${error.message}</p>
+                <script>setTimeout(() => window.close(), 3000);</script>
+              </body></html>`
+            };
+          }
+        } else if (path.includes('/shopify/sync')) {
+          // Sync data using stored access token
+          const body = JSON.parse(event.body || '{}');
+          const { userId, shopifyDomain, storeId, syncType } = body;
+          
+          // Normalize the domain - ensure it has .myshopify.com
+          let storeDomain = shopifyDomain || storeId || '';
+          if (storeDomain && !storeDomain.includes('.myshopify.com')) {
+            storeDomain = `${storeDomain}.myshopify.com`;
+          }
+          
+          console.log('Sync request:', { userId, storeDomain, syncType });
+          
+          if (!storeDomain || !userId) {
+            return {
+              statusCode: 400,
+              headers: corsHeaders,
+              body: JSON.stringify({ 
+                error: 'Missing required parameters',
+                required: ['userId', 'shopifyDomain or storeId']
+              })
+            };
+          }
+          
+          // Try to get access token from DynamoDB
+          let tokenResult;
+          try {
+            tokenResult = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `store_${storeDomain}`,
+                sk: `user_${userId}`
+              }
+            }).promise();
+          } catch (error) {
+            console.error('Error retrieving store token:', error);
+            // Try without the full domain in case it was stored differently
+            if (storeDomain.includes('.myshopify.com')) {
+              const shortDomain = storeDomain.replace('.myshopify.com', '');
+              try {
+                tokenResult = await dynamodb.get({
+                  TableName: process.env.TABLE_NAME,
+                  Key: {
+                    pk: `store_${shortDomain}`,
+                    sk: `user_${userId}`
+                  }
+                }).promise();
+              } catch (e) {
+                // Ignore and continue
+              }
+            }
+          }
+          
+          if (!tokenResult || !tokenResult.Item || !tokenResult.Item.accessToken) {
+            console.log('Store not found, trying scan for user stores...');
+            // Fallback to scan to find any stores for this user
+            try {
+              const scanResult = await dynamodb.scan({
+                TableName: process.env.TABLE_NAME,
+                FilterExpression: 'sk = :sk AND begins_with(pk, :pkPrefix)',
+                ExpressionAttributeValues: {
+                  ':sk': `user_${userId}`,
+                  ':pkPrefix': 'store_'
+                }
+              }).promise();
+              
+              if (scanResult.Items && scanResult.Items.length > 0) {
+                const matchingStore = scanResult.Items.find(item => 
+                  item.storeDomain === storeDomain || 
+                  item.storeDomain === storeDomain.replace('.myshopify.com', '') ||
+                  item.pk === `store_${storeDomain}` ||
+                  item.pk === `store_${storeDomain.replace('.myshopify.com', '')}`
+                );
+                
+                if (matchingStore && matchingStore.accessToken) {
+                  tokenResult = { Item: matchingStore };
+                }
+              }
+            } catch (scanError) {
+              console.error('Scan error:', scanError);
+            }
+          }
+          
+          // If still no token found
+          if (!tokenResult || !tokenResult.Item || !tokenResult.Item.accessToken) {
+            return {
+              statusCode: 401,
+              headers: corsHeaders,
+              body: JSON.stringify({ 
+                error: 'Store not connected. Please reconnect your Shopify store.',
+                details: `No access token found for store: ${storeDomain}`
+              })
+            };
+          }
+          
+          const accessToken = tokenResult.Item.accessToken;
+          const actualStoreDomain = tokenResult.Item.storeDomain || storeDomain;
+          
+          console.log('Starting Shopify data sync for:', actualStoreDomain);
+          
+          try {
+            // Fetch real data from Shopify in parallel
+            const [productsData, ordersData, customersData] = await Promise.allSettled([
+              // Fetch products
+              makeShopifyRequest(actualStoreDomain, accessToken, '/products.json?limit=250'),
+              // Fetch orders (last 60 days)
+              makeShopifyRequest(actualStoreDomain, accessToken, '/orders.json?status=any&limit=250'),
+              // Fetch customers
+              makeShopifyRequest(actualStoreDomain, accessToken, '/customers.json?limit=250')
+            ]);
+            
+            // Process products
+            let products = [];
+            let inventory = 0;
+            if (productsData.status === 'fulfilled' && productsData.value.products) {
+              products = productsData.value.products;
+              
+              // Store products in DynamoDB (limit to 50 for initial sync to avoid throttling)
+              for (const product of products.slice(0, 50)) {
+                const variants = product.variants || [];
+                for (const variant of variants) {
+                  inventory += variant.inventory_quantity || 0;
+                  
+                  // Store product in DynamoDB
+                  await dynamodb.put({
+                    TableName: process.env.TABLE_NAME,
+                    Item: {
+                      pk: `user_${userId}`,
+                      sk: `product_${product.id}_${variant.id}`,
+                      productId: product.id.toString(),
+                      variantId: variant.id.toString(),
+                      title: product.title,
+                      variantTitle: variant.title,
+                      sku: variant.sku,
+                      price: variant.price,
+                      inventory: variant.inventory_quantity || 0,
+                      storeDomain: actualStoreDomain,
+                      syncedAt: new Date().toISOString()
+                    }
+                  }).promise().catch(err => console.error('Error storing product:', err));
+                }
+              }
+              console.log(`Processed ${products.length} products with ${inventory} total inventory`);
+            } else if (productsData.status === 'rejected') {
+              console.error('Failed to fetch products:', productsData.reason);
+            }
+            
+            // Process orders
+            let orders = [];
+            let totalRevenue = 0;
+            if (ordersData.status === 'fulfilled' && ordersData.value.orders) {
+              orders = ordersData.value.orders;
+              
+              // Store orders in DynamoDB (limit to 50 for initial sync)
+              for (const order of orders.slice(0, 50)) {
+                totalRevenue += parseFloat(order.total_price || 0);
+                
+                await dynamodb.put({
+                  TableName: process.env.TABLE_NAME,
+                  Item: {
+                    pk: `user_${userId}`,
+                    sk: `order_${order.id}`,
+                    orderId: order.id.toString(),
+                    orderNumber: order.order_number,
+                    customerEmail: order.email,
+                    totalPrice: order.total_price,
+                    currency: order.currency,
+                    status: order.financial_status,
+                    fulfillmentStatus: order.fulfillment_status,
+                    lineItems: order.line_items ? order.line_items.length : 0,
+                    createdAt: order.created_at,
+                    storeDomain: actualStoreDomain,
+                    syncedAt: new Date().toISOString()
+                  }
+                }).promise().catch(err => console.error('Error storing order:', err));
+              }
+              console.log(`Processed ${orders.length} orders with total revenue: ${totalRevenue}`);
+            } else if (ordersData.status === 'rejected') {
+              console.error('Failed to fetch orders:', ordersData.reason);
+            }
+            
+            // Process customers
+            let customers = [];
+            if (customersData.status === 'fulfilled' && customersData.value.customers) {
+              customers = customersData.value.customers;
+              console.log(`Found ${customers.length} customers`);
+            } else if (customersData.status === 'rejected') {
+              console.error('Failed to fetch customers:', customersData.reason);
+            }
+            
+            // Store metadata about the sync
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `user_${userId}`,
+                sk: `store_${actualStoreDomain}_metadata`,
+                customerCount: customers.length,
+                productCount: products.length,
+                orderCount: orders.length,
+                totalInventory: inventory,
+                totalRevenue: totalRevenue.toFixed(2),
+                lastSyncedAt: new Date().toISOString()
+              }
+            }).promise().catch(err => console.error('Error storing metadata:', err));
+            
+            // Update store record with sync status
+            await dynamodb.update({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `store_${actualStoreDomain}`,
+                sk: `user_${userId}`
+              },
+              UpdateExpression: 'SET lastSyncedAt = :now, syncStatus = :status',
+              ExpressionAttributeValues: {
+                ':now': new Date().toISOString(),
+                ':status': 'completed'
+              }
+            }).promise().catch(err => console.error('Error updating store:', err));
+            
+            console.log(`Sync completed successfully for ${actualStoreDomain}`);
+            
+            responseData = {
+              success: true,
+              message: 'Store data synced successfully',
+              data: {
+                storeId: tokenResult.Item.pk || `store_${actualStoreDomain}`,
+                storeName: actualStoreDomain.replace('.myshopify.com', ''),
+                storeDomain: actualStoreDomain,
+                syncedAt: new Date().toISOString(),
+                products: products.length,
+                orders: orders.length,
+                customers: customers.length,
+                inventory: inventory,
+                totalRevenue: totalRevenue.toFixed(2)
+              }
+            };
+          } catch (syncError) {
+            console.error('Error during sync:', syncError);
+            // Return partial success even if sync fails
+            responseData = {
+              success: false,
+              message: `Store connected but sync failed: ${syncError.message}`,
+              error: syncError.message,
+              data: {
+                storeId: tokenResult.Item.pk || `store_${actualStoreDomain}`,
+                storeName: actualStoreDomain.replace('.myshopify.com', ''),
+                storeDomain: actualStoreDomain,
+                syncedAt: new Date().toISOString(),
+                products: 0,
+                orders: 0,
+                customers: 0,
+                inventory: 0
+              }
+            };
+          }
+        } else {
+          responseData = {
+            message: 'Shopify integration endpoint',
+            endpoints: ['/api/shopify/connect', '/api/shopify/callback', '/api/shopify/sync']
+          };
+        }
+        break;
+        
+      case 'auth':
+        // Handle authentication endpoints
+        const authPath = pathParts[2]; // e.g., login, register
+        const body = JSON.parse(event.body || '{}');
+        const cognito = new AWS.CognitoIdentityServiceProvider();
+        
+        if (authPath === 'login' && method === 'POST') {
+          try {
+            const { email, password } = body;
+            
+            if (!email || !password) {
+              return {
+                statusCode: 400,
+                headers: corsHeaders,
+                body: JSON.stringify({ success: false, error: 'Email and password required' })
+              };
+            }
+            
+            // Authenticate with Cognito
+            const authResult = await cognito.adminInitiateAuth({
+              UserPoolId: process.env.USER_POOL_ID,
+              ClientId: process.env.USER_POOL_CLIENT_ID,
+              AuthFlow: 'ADMIN_USER_PASSWORD_AUTH',
+              AuthParameters: {
+                USERNAME: email,
+                PASSWORD: password
+              }
+            }).promise();
+            
+            responseData = {
+              success: true,
+              tokens: {
+                AccessToken: authResult.AuthenticationResult.AccessToken,
+                RefreshToken: authResult.AuthenticationResult.RefreshToken,
+                IdToken: authResult.AuthenticationResult.IdToken,
+                ExpiresIn: authResult.AuthenticationResult.ExpiresIn,
+                TokenType: authResult.AuthenticationResult.TokenType
+              }
+            };
+          } catch (error) {
+            console.error('Login error:', error);
+            return {
+              statusCode: 401,
+              headers: corsHeaders,
+              body: JSON.stringify({ 
+                success: false, 
+                error: error.code === 'NotAuthorizedException' ? 'Invalid credentials' : 'Login failed'
+              })
+            };
+          }
+        } else if (authPath === 'register' && method === 'POST') {
+          try {
+            const { email, password, companyName, firstName, lastName } = body;
+            
+            if (!email || !password || !companyName) {
+              return {
+                statusCode: 400,
+                headers: corsHeaders,
+                body: JSON.stringify({ 
+                  success: false, 
+                  error: 'Email, password and company name required' 
+                })
+              };
+            }
+            
+            // Generate unique company ID
+            const companyId = 'company-' + Date.now() + '-' + Math.random().toString(36).substring(7);
+            
+            // Create user in Cognito
+            const createUserResult = await cognito.adminCreateUser({
+              UserPoolId: process.env.USER_POOL_ID,
+              Username: email,
+              UserAttributes: [
+                { Name: 'email', Value: email },
+                { Name: 'email_verified', Value: 'true' },
+                { Name: 'custom:company_id', Value: companyId },
+                { Name: 'custom:company_name', Value: companyName },
+                { Name: 'custom:role', Value: 'admin' }
+              ],
+              TemporaryPassword: password,
+              MessageAction: 'SUPPRESS'
+            }).promise();
+            
+            // Set permanent password
+            await cognito.adminSetUserPassword({
+              UserPoolId: process.env.USER_POOL_ID,
+              Username: email,
+              Password: password,
+              Permanent: true
+            }).promise();
+            
+            // Store company info in DynamoDB
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `company_${companyId}`,
+                sk: 'metadata',
+                companyName: companyName,
+                adminEmail: email,
+                createdAt: new Date().toISOString()
+              }
+            }).promise();
+            
+            responseData = {
+              success: true,
+              message: 'Registration successful',
+              userId: createUserResult.User.Username,
+              companyId: companyId,
+              companyName: companyName
+            };
+          } catch (error) {
+            console.error('Registration error:', error);
+            return {
+              statusCode: 400,
+              headers: corsHeaders,
+              body: JSON.stringify({ 
+                success: false, 
+                error: error.code === 'UsernameExistsException' ? 'User already exists' : 'Registration failed'
+              })
+            };
+          }
+        } else if (authPath === 'forgot-password' && method === 'POST') {
+          try {
+            const { email } = body;
+            
+            await cognito.forgotPassword({
+              ClientId: process.env.USER_POOL_CLIENT_ID,
+              Username: email
+            }).promise();
+            
+            responseData = {
+              success: true,
+              message: 'Password reset email sent'
+            };
+          } catch (error) {
+            console.error('Forgot password error:', error);
+            responseData = {
+              success: true, // Always return success to avoid user enumeration
+              message: 'If the email exists, a password reset link has been sent'
+            };
+          }
+        } else if (authPath === 'refresh' && method === 'POST') {
+          try {
+            const { refreshToken } = body;
+            
+            const authResult = await cognito.adminInitiateAuth({
+              UserPoolId: process.env.USER_POOL_ID,
+              ClientId: process.env.USER_POOL_CLIENT_ID,
+              AuthFlow: 'REFRESH_TOKEN_AUTH',
+              AuthParameters: {
+                REFRESH_TOKEN: refreshToken
+              }
+            }).promise();
+            
+            responseData = {
+              success: true,
+              tokens: {
+                AccessToken: authResult.AuthenticationResult.AccessToken,
+                IdToken: authResult.AuthenticationResult.IdToken,
+                ExpiresIn: authResult.AuthenticationResult.ExpiresIn,
+                TokenType: authResult.AuthenticationResult.TokenType
+              }
+            };
+          } catch (error) {
+            console.error('Refresh token error:', error);
+            return {
+              statusCode: 401,
+              headers: corsHeaders,
+              body: JSON.stringify({ success: false, error: 'Invalid refresh token' })
+            };
+          }
+        } else {
+          responseData = {
+            message: 'Authentication endpoint',
+            availableEndpoints: ['/api/auth/login', '/api/auth/register', '/api/auth/forgot-password', '/api/auth/refresh']
+          };
+        }
+        break;
+        
+      default:
+        responseData = {
+          message: 'OrderNimbus API',
+          version: '1.0',
+          environment: process.env.ENVIRONMENT,
+          path: path,
+          method: method
+        };
+    }
+    
+    return {
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify(responseData)
+    };
+    
+  } catch (error) {
+    console.error('Error:', error);
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'Internal server error' })
+    };
+  }
+};

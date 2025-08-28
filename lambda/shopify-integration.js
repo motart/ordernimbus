@@ -12,19 +12,21 @@ if (process.env.DYNAMODB_ENDPOINT) {
 }
 
 const dynamodb = new AWS.DynamoDB.DocumentClient(dynamoConfig);
-const secretsManager = new AWS.SecretsManager({ region: process.env.AWS_REGION || 'us-west-1' });
+const ssm = new AWS.SSM({ region: process.env.AWS_REGION || 'us-west-1' });
 
 // Import new GraphQL services
 const ProductService = require('./shopify/services/productService');
 const InventoryService = require('./shopify/services/inventoryService');
+const OrderService = require('./shopify/services/orderService');
+const ShopService = require('./shopify/services/shopService');
 
 // Cache for Shopify credentials to avoid repeated calls
 let shopifyCredentials = null;
 
 // Use latest API version
-const SHOPIFY_API_VERSION = '2024-07';
+const SHOPIFY_API_VERSION = '2024-10';
 
-// Helper function to get Shopify credentials from AWS Secrets Manager
+// Helper function to get Shopify credentials from AWS SSM Parameter Store
 const getShopifyCredentials = async () => {
   if (shopifyCredentials) {
     return shopifyCredentials;
@@ -32,15 +34,19 @@ const getShopifyCredentials = async () => {
 
   try {
     const environment = process.env.ENVIRONMENT || 'staging';
-    const secretName = `ordernimbus/${environment}/shopify`;
+    const parameterName = `/ordernimbus/${environment}/shopify`;
     
-    console.log(`Fetching Shopify credentials from Secrets Manager: ${secretName}`);
+    // Fetching Shopify credentials from SSM Parameter Store
     
-    const secret = await secretsManager.getSecretValue({ SecretId: secretName }).promise();
-    const credentials = JSON.parse(secret.SecretString);
+    const result = await ssm.getParameter({
+      Name: parameterName,
+      WithDecryption: true
+    }).promise();
+    
+    const credentials = JSON.parse(result.Parameter.Value);
     
     if (!credentials.SHOPIFY_CLIENT_ID || !credentials.SHOPIFY_CLIENT_SECRET) {
-      throw new Error('Invalid Shopify credentials in Secrets Manager');
+      throw new Error('Invalid Shopify credentials in SSM Parameter Store');
     }
 
     // Cache credentials for the duration of this Lambda execution
@@ -51,15 +57,15 @@ const getShopifyCredentials = async () => {
       redirectUri: credentials.SHOPIFY_REDIRECT_URI || ''
     };
     
-    console.log('Successfully retrieved Shopify credentials');
+    // Successfully retrieved Shopify credentials
     return shopifyCredentials;
     
   } catch (error) {
-    console.error('Error fetching Shopify credentials from Secrets Manager:', error);
+    console.error('Error fetching Shopify credentials from SSM Parameter Store:', error);
     
     // Fallback to environment variables for local development
     if (process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET) {
-      console.log('Using fallback environment variables for local development');
+      // Using fallback environment variables for local development
       return {
         apiKey: process.env.SHOPIFY_CLIENT_ID,
         apiSecret: process.env.SHOPIFY_CLIENT_SECRET,
@@ -68,7 +74,7 @@ const getShopifyCredentials = async () => {
       };
     }
     
-    throw new Error('Failed to retrieve Shopify credentials. Ensure they are stored in AWS Secrets Manager.');
+    throw new Error('Failed to retrieve Shopify credentials. Ensure they are stored in AWS SSM Parameter Store.');
   }
 };
 
@@ -115,8 +121,8 @@ const fetchShopifyProducts = async (domain, apiKey) => {
     throw new Error('API key is required. Please connect your Shopify store using OAuth or provide an API token.');
   }
   
-  // Use GraphQL service if feature flag is enabled
-  if (process.env.USE_GRAPHQL_PRODUCTS !== 'false') {
+  // Always use GraphQL (feature flag defaults to true)
+  if (true) { // GraphQL is always enabled
     const productService = new ProductService(domain, apiKey);
     
     // Fetch all products (handles pagination automatically)
@@ -130,122 +136,32 @@ const fetchShopifyProducts = async (domain, apiKey) => {
   }
 };
 
-// Fetch orders from Shopify - Try GraphQL first, fallback to REST
+// Fetch orders from Shopify using GraphQL only
 const fetchShopifyOrders = async (domain, apiKey) => {
   if (!apiKey) {
     throw new Error('API key is required. Please connect your Shopify store using OAuth or provide an API token.');
   }
   
-  // Try GraphQL API first (often has better access in dev stores)
-  try {
-    const sinceDate = new Date();
-    sinceDate.setDate(sinceDate.getDate() - 90);
-    
-    const graphqlQuery = {
-      query: `
-        query GetOrders($first: Int!, $query: String) {
-          orders(first: $first, query: $query) {
-            edges {
-              node {
-                id
-                name
-                createdAt
-                updatedAt
-                totalPriceSet {
-                  shopMoney {
-                    amount
-                    currencyCode
-                  }
-                }
-                subtotalPriceSet {
-                  shopMoney {
-                    amount
-                  }
-                }
-                lineItems(first: 100) {
-                  edges {
-                    node {
-                      id
-                      title
-                      quantity
-                      product {
-                        id
-                      }
-                      variant {
-                        id
-                        price
-                      }
-                      originalTotalSet {
-                        shopMoney {
-                          amount
-                        }
-                      }
-                    }
-                  }
-                }
-                customer {
-                  id
-                }
-                fulfillmentStatus
-                financialStatus
-              }
-            }
-          }
-        }
-      `,
-      variables: {
-        first: 100,
-        query: `created_at:>'${sinceDate.toISOString().split('T')[0]}'`
-      }
-    };
-    
-    const url = buildShopifyUrl(domain, 'graphql.json');
-    const response = await axios.post(url, graphqlQuery, {
-      headers: {
-        'X-Shopify-Access-Token': apiKey,
-        'Content-Type': 'application/json'
-      }
-    });
-    
-    if (response.data.data && response.data.data.orders) {
-      // Transform GraphQL response to match REST format
-      const orders = response.data.data.orders.edges.map(edge => {
-        const node = edge.node;
-        return {
-          id: node.id.split('/').pop(),
-          name: node.name,
-          created_at: node.createdAt,
-          updated_at: node.updatedAt,
-          total_price: node.totalPriceSet.shopMoney.amount,
-          subtotal_price: node.subtotalPriceSet.shopMoney.amount,
-          currency: node.totalPriceSet.shopMoney.currencyCode,
-          financial_status: node.financialStatus,
-          fulfillment_status: node.fulfillmentStatus,
-          line_items: node.lineItems.edges.map(item => ({
-            id: item.node.id.split('/').pop(),
-            product_id: item.node.product ? item.node.product.id.split('/').pop() : null,
-            title: item.node.title,
-            quantity: item.node.quantity,
-            price: item.node.variant ? item.node.variant.price : '0',
-            total: item.node.originalTotalSet.shopMoney.amount
-          }))
-        };
-      });
-      
-      console.log(`Successfully fetched ${orders.length} orders via GraphQL`);
-      return orders;
-    }
-  } catch (graphqlError) {
-    console.log('GraphQL failed, trying REST API:', graphqlError.response?.data?.errors || graphqlError.message);
-  }
+  // Always use GraphQL via OrderService
+  const orderService = new OrderService(domain, apiKey);
   
-  // Fallback to REST API
+  // Fetch orders from last 90 days
   const sinceDate = new Date();
   sinceDate.setDate(sinceDate.getDate() - 90);
-  const since = sinceDate.toISOString();
   
-  const data = await shopifyRequest(domain, apiKey, `orders.json?status=any&created_at_min=${since}&limit=250`);
-  return data.orders || [];
+  try {
+    const orders = await orderService.fetchAllOrders({ 
+      sinceDate, 
+      maxOrders: 10000 
+    });
+    
+    console.log(`Successfully fetched ${orders.length} orders via GraphQL`);
+    return orders;
+  } catch (error) {
+    console.error('Failed to fetch orders via GraphQL:', error.message);
+    // Return empty array instead of throwing to allow partial sync
+    return [];
+  }
 };
 
 // Generate sample orders for development/testing when real orders are blocked
@@ -356,8 +272,8 @@ const fetchShopifyInventory = async (domain, apiKey, locationId) => {
     throw new Error('API key is required. Please connect your Shopify store using OAuth or provide an API token.');
   }
   
-  // Use GraphQL service if feature flag is enabled
-  if (process.env.USE_GRAPHQL_PRODUCTS !== 'false') {
+  // Always use GraphQL (feature flag defaults to true)
+  if (true) { // GraphQL is always enabled
     const inventoryService = new InventoryService(domain, apiKey);
     
     // Get locations if not provided
@@ -590,7 +506,22 @@ const updateStoreSyncStatus = async (userId, storeId, status, metadata = {}) => 
 const handleShopifyConnect = async (event) => {
   console.log('Handling Shopify connect request');
   
-  const { userId, storeDomain } = JSON.parse(event.body);
+  const body = JSON.parse(event.body);
+  const { storeDomain } = body;
+  
+  // Extract userId from JWT authorizer context
+  let userId;
+  if (event.requestContext?.authorizer?.lambda?.userId) {
+    userId = event.requestContext.authorizer.lambda.userId;
+  } else if (event.requestContext?.authorizer?.userId) {
+    userId = event.requestContext.authorizer.userId;
+  } else if (event.requestContext?.authorizer?.claims?.sub) {
+    userId = event.requestContext.authorizer.claims.sub;
+  } else if (body.userId) {
+    // Fallback for testing
+    console.warn('Using userId from body - should be from JWT');
+    userId = body.userId;
+  }
   
   if (!userId || !storeDomain) {
     return {
@@ -612,24 +543,38 @@ const handleShopifyConnect = async (event) => {
   const credentials = await getShopifyCredentials();
   const SHOPIFY_API_KEY = credentials.apiKey;
   
-  // Use redirect URI from credentials or determine based on environment
-  let redirectUri = credentials.redirectUri;
-  if (!redirectUri) {
-    // Auto-detect environment and set appropriate redirect URI
-    const environment = process.env.ENVIRONMENT || 'local';
-    switch (environment) {
-      case 'staging':
-        redirectUri = 'https://staging.ordernimbus.com/api/shopify/callback';
-        break;
-      case 'production':
-        redirectUri = 'https://app.ordernimbus.com/api/shopify/callback';
-        break;
-      default:
-        redirectUri = 'http://localhost:3001/api/shopify/callback';
+  // Prioritize dynamic redirect URI generation when API Gateway context is available
+  let redirectUri;
+  
+  // Get the API Gateway URL from the event context first
+  if (event.requestContext && event.requestContext.domainName) {
+    const stage = event.requestContext.stage || 'production';
+    redirectUri = `https://${event.requestContext.domainName}/${stage}/api/shopify/callback`;
+  } else {
+    // Use stored redirect URI from credentials if no context available
+    redirectUri = credentials.redirectUri;
+    
+    if (!redirectUri) {
+      // Fallback to environment-based URLs
+      const environment = process.env.ENVIRONMENT || 'local';
+      switch (environment) {
+        case 'staging':
+          redirectUri = process.env.API_URL ? 
+            `${process.env.API_URL}/api/shopify/callback` : 
+            'https://staging.ordernimbus.com/api/shopify/callback';
+          break;
+        case 'production':
+          redirectUri = process.env.API_URL ? 
+            `${process.env.API_URL}/api/shopify/callback` : 
+            'https://7tdwngcc30.execute-api.us-west-1.amazonaws.com/production/api/shopify/callback';
+          break;
+        default:
+          redirectUri = 'http://localhost:3001/api/shopify/callback';
+      }
     }
   }
   
-  console.log('Using Shopify redirect URI:', redirectUri);
+  // Using the computed Shopify redirect URI
   
   // Required Shopify OAuth scopes
   const scopes = [
@@ -729,14 +674,29 @@ const handleShopifyCallback = async (event) => {
     
     const { access_token } = tokenResponse.data;
     
-    // Get shop info
-    const shopResponse = await axios.get(`https://${shop}/admin/api/2024-01/shop.json`, {
-      headers: {
-        'X-Shopify-Access-Token': access_token
-      }
-    });
+    // Get shop info using GraphQL
+    const shopService = new ShopService(shop, access_token);
+    const shopData = await shopService.fetchShopInfo();
     
-    const shopData = shopResponse.data.shop;
+    // Save store credentials to DynamoDB
+    const tableName = `${process.env.TABLE_PREFIX || 'ordernimbus-local'}-stores`;
+    const storeId = shopData.domain.replace('.myshopify.com', '');
+    
+    await dynamodb.put({
+      TableName: tableName,
+      Item: {
+        userId,
+        id: storeId,
+        storeId,
+        storeName: shopData.name,
+        shopifyDomain: shopData.domain,
+        apiKey: access_token,
+        status: 'active',
+        type: 'shopify',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    }).promise();
     
     return {
       statusCode: 200,
@@ -764,6 +724,15 @@ const handleShopifyCallback = async (event) => {
     };
   } catch (error) {
     console.error('Error in OAuth callback:', error);
+    
+    // Determine error message based on error type
+    let errorMessage = 'Failed to complete OAuth flow';
+    if (error.message && error.message.includes('401')) {
+      errorMessage = 'Failed to exchange code for access token';
+    } else if (error.message && error.message.includes('Request failed')) {
+      errorMessage = 'Failed to exchange code for access token';
+    }
+    
     return {
       statusCode: 500,
       headers: {
@@ -775,7 +744,7 @@ const handleShopifyCallback = async (event) => {
             <script>
               window.opener.postMessage({
                 type: 'shopify-oauth-error',
-                error: 'Failed to complete OAuth flow'
+                error: '${errorMessage}'
               }, '*');
               window.close();
             </script>
@@ -802,8 +771,27 @@ exports.handler = async (event) => {
     }
     
     // Default to sync flow
-    const { userId, storeId, shopifyDomain, apiKey, syncType = 'full', locationId } = 
-      event.body ? JSON.parse(event.body) : event;
+    const body = event.body ? JSON.parse(event.body) : event;
+    const { storeId, shopifyDomain, apiKey, syncType = 'full', locationId } = body;
+    
+    // Extract userId from JWT authorizer context
+    let userId;
+    if (event.requestContext?.authorizer?.lambda?.userId) {
+      // API Gateway v2 with Lambda authorizer
+      userId = event.requestContext.authorizer.lambda.userId;
+    } else if (event.requestContext?.authorizer?.userId) {
+      // Alternative authorizer context structure
+      userId = event.requestContext.authorizer.userId;
+    } else if (event.requestContext?.authorizer?.claims?.sub) {
+      // Direct JWT claims from Cognito authorizer
+      userId = event.requestContext.authorizer.claims.sub;
+    } else if (body.userId) {
+      // Fallback to body for backwards compatibility
+      console.warn('Using userId from body - should be from JWT');
+      userId = body.userId;
+    }
+    
+    console.log('Extracted userId:', userId);
     
     if (!userId || !storeId || !shopifyDomain) {
       return {
@@ -988,8 +976,8 @@ exports.handler = async (event) => {
         'Access-Control-Allow-Origin': '*'
       },
       body: JSON.stringify({
-        error: 'Failed to sync Shopify data',
-        message: error.message
+        error: error.message,
+        message: 'Failed to sync Shopify data'
       })
     };
   }

@@ -2,6 +2,11 @@
 
 AI-powered sales forecasting platform for brick-and-mortar retailers and Shopify merchants. Multi-tenant, highly-scalable platform with AWS-native infrastructure.
 
+## 🌐 Production URLs
+- **Application**: https://app.ordernimbus.com
+- **API**: https://p12brily0d.execute-api.us-west-1.amazonaws.com/production
+- **Shopify OAuth Callback**: https://p12brily0d.execute-api.us-west-1.amazonaws.com/production/api/shopify/callback
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -71,20 +76,62 @@ aws cloudformation delete-stack --stack-name ordernimbus-staging --region us-eas
 npm run rollback:verify:staging
 ```
 
-## Architecture Overview
+## 🏗️ Architecture Overview
+
+### Tech Stack
+- **Frontend**: React 19 with TypeScript, Tailwind CSS, Recharts
+- **Backend**: AWS Lambda (Node.js 18.x), API Gateway HTTP APIs
+- **Authentication**: AWS Cognito with multi-tenant isolation
+- **Database**: DynamoDB (single-table design), Aurora Serverless v2 (analytics)
+- **Storage**: S3 for static hosting, file uploads, and data lake
+- **CDN**: CloudFront with custom domain (app.ordernimbus.com)
+- **Infrastructure**: CloudFormation, AWS CDK, Terraform modules
+- **ML/AI**: SageMaker for forecasting, Bedrock for conversational AI
+- **Integration**: Shopify OAuth, REST APIs, Webhooks
+
+### Component Architecture
+```
+┌─────────────────────────────────────────────────────────┐
+│                   CloudFront CDN                         │
+│                 (app.ordernimbus.com)                    │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────┐
+│              S3 Static Website                           │
+│         (React SPA - Production Build)                   │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────┐
+│            API Gateway (HTTP API)                        │
+│        (api.ordernimbus.com → Lambda)                    │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+┌─────────────────▼───────────────────────────────────────┐
+│          Lambda Function (Monolithic)                    │
+│    - Authentication (Cognito Integration)                │
+│    - Shopify OAuth & Data Sync                          │
+│    - Business Logic & API Routes                        │
+└──────┬──────────┬──────────┬────────────────────────────┘
+       │          │          │
+┌──────▼────┐ ┌──▼───┐ ┌────▼─────┐
+│ DynamoDB  │ │ S3   │ │ Secrets  │
+│  (Main)   │ │      │ │ Manager  │
+└───────────┘ └──────┘ └──────────┘
+```
 
 ### Auto-Scaling Components
 - **ECS Fargate**: 2-100 tasks with CPU/memory-based scaling
 - **Aurora Serverless v2**: 0.5-128 ACUs with automatic scaling
 - **API Gateway**: 10k RPS burst protection with regional deployment
-- **MWAA**: k8s-executor with 1-50 auto-scaling workers
+- **Lambda**: Provisioned concurrency for predictable performance
 
 ### Key Features
-- Multi-tenant data isolation with tenant-aware partitioning
+- Multi-tenant data isolation with company-based partitioning
 - Real-time data ingestion from CSV uploads and Shopify APIs
-- ML forecasting pipeline with SageMaker integration
+- ML forecasting pipeline with time-series analysis
+- OAuth-based Shopify store connection
+- Dynamic configuration management
 - Comprehensive monitoring and cost anomaly detection
-- Load testing with nightly performance regression checks
 
 ## Development Commands
 
