@@ -1461,7 +1461,7 @@ exports.handler = async (event) => {
           console.log('Deleting store:', storeId, 'for user:', storesUserId);
           
           try {
-            // First, verify the store exists and belongs to the user
+            // First, verify the store exists and belongs to the user (NEW FORMAT ONLY)
             const storeCheck = await dynamodb.get({
               TableName: process.env.TABLE_NAME,
               Key: {
@@ -1471,28 +1471,17 @@ exports.handler = async (event) => {
             }).promise();
             
             if (!storeCheck.Item) {
-              // Try old format
-              const oldFormatCheck = await dynamodb.get({
-                TableName: process.env.TABLE_NAME,
-                Key: {
-                  userId: storesUserId,
-                  id: `store#${storeId}`
-                }
-              }).promise();
-              
-              if (!oldFormatCheck.Item) {
-                responseData = {
-                  error: 'Store not found or you do not have permission to delete it'
-                };
-                statusCode = 404;
-                break;
-              }
+              responseData = {
+                error: 'Store not found or you do not have permission to delete it'
+              };
+              statusCode = 404;
+              break;
             }
             
             // Store found and belongs to user, proceed with deletion
             const deletedStore = storeCheck.Item || {};
             
-            // Delete the store metadata
+            // Delete the store metadata (NEW FORMAT ONLY)
             await dynamodb.delete({
               TableName: process.env.TABLE_NAME,
               Key: {
@@ -1501,19 +1490,6 @@ exports.handler = async (event) => {
               },
               ReturnValues: 'ALL_OLD'
             }).promise();
-            
-            // Also try to delete old format if it exists
-            try {
-              await dynamodb.delete({
-                TableName: process.env.TABLE_NAME,
-                Key: {
-                  userId: storesUserId,
-                  id: `store#${storeId}`
-                }
-              }).promise();
-            } catch (e) {
-              // Ignore if old format doesn't exist
-            }
             
             console.log('Store deleted successfully:', storeId);
             
@@ -1798,40 +1774,26 @@ exports.handler = async (event) => {
           console.log('Fetching stores for user:', storesUserId);
           
           try {
-            // Query DynamoDB for user's stores (both old and new formats)
-            const [newFormatStores, oldFormatStores] = await Promise.all([
-              dynamodb.query({
-                TableName: process.env.TABLE_NAME,
-                KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
-                ExpressionAttributeValues: {
-                  ':pk': `USER#${storesUserId}`,
-                  ':skPrefix': 'STORE#'
-                }
-              }).promise(),
-              dynamodb.query({
-                TableName: process.env.TABLE_NAME,
-                KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
-                ExpressionAttributeValues: {
-                  ':pk': `user_${storesUserId}`,
-                  ':skPrefix': 'store_'
-                }
-              }).promise()
-            ]);
-            
-            const storesResult = {
-              Items: [...(newFormatStores.Items || []), ...(oldFormatStores.Items || [])]
-            };
+            // Query DynamoDB for user's stores (NEW FORMAT ONLY)
+            const storesResult = await dynamodb.query({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'pk = :pk AND begins_with(sk, :skPrefix)',
+              ExpressionAttributeValues: {
+                ':pk': `USER#${storesUserId}`,
+                ':skPrefix': 'STORE#'
+              }
+            }).promise();
             
             console.log(`Found ${storesResult.Items?.length || 0} stores in DynamoDB`);
             
             // Transform DynamoDB items to store format
             const stores = (storesResult.Items || []).map(item => {
-              // For new format: STORE#storeId_metadata
-              // For old format: store_{domain}_metadata
-              // Use the actual data from the item instead of parsing the sk
+              // NEW FORMAT ONLY: STORE#storeId_metadata
+              // The storeId should always be present in the item
+              const storeId = item.storeId || item.sk.replace('STORE#', '').replace('_metadata', '');
               
               return {
-                id: item.storeId || item.sk,
+                id: storeId,
                 name: item.storeName || item.name || item.displayName || 'Unnamed Store',
                 displayName: item.displayName || item.storeName || item.name || 'Unnamed Store',
                 type: item.storeType || item.type || 'brick-and-mortar',
