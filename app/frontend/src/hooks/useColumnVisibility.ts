@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { ColumnDefinition } from '../components/ColumnSelector';
 import { useAuth } from '../contexts/AuthContext';
 import { createAuthenticatedFetch } from '../utils/authenticatedFetch';
@@ -26,10 +26,15 @@ export const useColumnVisibility = ({
   defaultVisible
 }: UseColumnVisibilityOptions) => {
   const { getAccessToken } = useAuth();
-  const authenticatedFetch = createAuthenticatedFetch({ getAccessToken });
+  // Memoize the authenticatedFetch function to prevent unnecessary re-renders
+  const authenticatedFetch = useMemo(() => 
+    createAuthenticatedFetch({ getAccessToken }), 
+    [getAccessToken]
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const saveTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
+  const hasInitialized = useRef(false);
 
   // Initialize visible columns from backend or defaults
   const [visibleColumns, setVisibleColumns] = useState<string[]>(() => {
@@ -42,8 +47,14 @@ export const useColumnVisibility = ({
       .map(col => col.key);
   });
 
-  // Fetch preferences from backend on mount
+  // Fetch preferences from backend on mount (only once)
   useEffect(() => {
+    // Prevent multiple initializations
+    if (hasInitialized.current) {
+      return;
+    }
+    hasInitialized.current = true;
+
     const fetchPreferences = async () => {
       try {
         const response = await authenticatedFetch('/api/preferences');
@@ -87,7 +98,9 @@ export const useColumnVisibility = ({
     };
 
     fetchPreferences();
-  }, [storageKey, columns, authenticatedFetch]);
+    // Remove authenticatedFetch from dependencies to prevent re-fetching
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageKey]);
 
   // Save preferences to backend with debouncing
   const savePreferences = useCallback(async (newColumns: string[]) => {
