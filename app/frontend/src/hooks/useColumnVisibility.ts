@@ -26,7 +26,7 @@ export const useColumnVisibility = ({
   defaultVisible
 }: UseColumnVisibilityOptions) => {
   const { getAccessToken } = useAuth();
-  // Memoize the authenticatedFetch function to prevent unnecessary re-renders
+  // Memoize authenticatedFetch to prevent re-renders and re-fetching
   const authenticatedFetch = useMemo(() => 
     createAuthenticatedFetch({ getAccessToken }), 
     [getAccessToken]
