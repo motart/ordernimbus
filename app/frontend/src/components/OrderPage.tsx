@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import './OrderPage.css';
+import '../styles/table-scroll.css';
 import toast from 'react-hot-toast';
 import { ClipLoader } from 'react-spinners';
 import { FiRefreshCw, FiSearch, FiFilter, FiShoppingBag, FiCheckCircle, FiClock, FiX, FiAlertCircle, FiUpload, FiPlus } from 'react-icons/fi';
@@ -92,6 +93,7 @@ interface Store {
 const OrderPage: React.FC = () => {
   const { getAccessToken } = useAuth();
   const authenticatedFetch = createAuthenticatedFetch({ getAccessToken });
+  const tableScrollRef = useRef<HTMLDivElement>(null);
   
   const [orders, setOrders] = useState<Order[]>([]);
   const [stores, setStores] = useState<Store[]>([]);
@@ -133,6 +135,51 @@ const OrderPage: React.FC = () => {
       loadOrders();
     }
   }, [selectedStore]);
+
+  // Handle horizontal scroll shadow indicators
+  useEffect(() => {
+    const handleScroll = () => {
+      if (!tableScrollRef.current) return;
+      
+      const element = tableScrollRef.current;
+      const isScrollable = element.scrollWidth > element.clientWidth;
+      const scrolledRight = element.scrollLeft > 0;
+      const fullyScrolled = element.scrollLeft + element.clientWidth >= element.scrollWidth - 1;
+      
+      // Add/remove classes for shadow indicators
+      if (isScrollable) {
+        element.classList.add('has-scroll');
+      } else {
+        element.classList.remove('has-scroll');
+      }
+      
+      if (scrolledRight) {
+        element.classList.add('scrolled-right');
+      } else {
+        element.classList.remove('scrolled-right');
+      }
+      
+      if (fullyScrolled) {
+        element.classList.remove('has-scroll');
+      }
+    };
+
+    const scrollContainer = tableScrollRef.current;
+    if (scrollContainer) {
+      scrollContainer.addEventListener('scroll', handleScroll);
+      // Check initial state
+      handleScroll();
+      
+      // Re-check when window resizes
+      const resizeObserver = new ResizeObserver(handleScroll);
+      resizeObserver.observe(scrollContainer);
+      
+      return () => {
+        scrollContainer.removeEventListener('scroll', handleScroll);
+        resizeObserver.disconnect();
+      };
+    }
+  }, [orders.length, searchTerm, statusFilter, fulfillmentFilter, visibleColumns]); // Re-check when data or columns change
 
   const loadStores = async () => {
     try {
@@ -539,27 +586,29 @@ const OrderPage: React.FC = () => {
             </button>
           </div>
         ) : (
-          <div className="orders-table-wrapper">
-            <table className="orders-table">
-              <thead>
-                <tr>
-                  {visibleColumnDefinitions.map(column => (
-                    <th key={column.key}>{column.label}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {filteredOrders.map((order) => (
-                  <tr key={order.id}>
+          <div className="table-scroll-container" ref={tableScrollRef}>
+            <div className="table-wrapper">
+              <table className="orders-table">
+                <thead>
+                  <tr>
                     {visibleColumnDefinitions.map(column => (
-                      <td key={column.key}>
-                        {renderTableCell(order, column.key)}
-                      </td>
+                      <th key={column.key}>{column.label}</th>
                     ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {filteredOrders.map((order) => (
+                    <tr key={order.id}>
+                      {visibleColumnDefinitions.map(column => (
+                        <td key={column.key}>
+                          {renderTableCell(order, column.key)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
             {columnsSaving && (
               <div className="saving-indicator">
                 Saving column preferences...

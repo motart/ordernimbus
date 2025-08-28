@@ -1,0 +1,97 @@
+/* Shared table horizontal scrolling styles */
+/* This CSS enables horizontal scrolling for all tabular data pages */
+
+.table-scroll-container {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: visible;
+  -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
+  margin-bottom: 1rem;
+}
+
+/* Ensure tables maintain their minimum width */
+.table-wrapper {
+  min-width: max-content;
+  width: 100%;
+}
+
+/* Style the scrollbar for better visibility */
+.table-scroll-container::-webkit-scrollbar {
+  height: 10px;
+}
+
+.table-scroll-container::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 5px;
+}
+
+.table-scroll-container::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 5px;
+}
+
+.table-scroll-container::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Firefox scrollbar styling */
+.table-scroll-container {
+  scrollbar-width: thin;
+  scrollbar-color: #888 #f1f1f1;
+}
+
+/* Ensure grid tables don't wrap */
+.table-header,
+.table-row {
+  white-space: nowrap;
+  min-width: max-content;
+}
+
+/* Prevent text wrapping in cells */
+.table-cell {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Add shadow to indicate scrollable content */
+.table-scroll-container {
+  position: relative;
+}
+
+/* Left shadow when scrolled right */
+.table-scroll-container.scrolled-right::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 20px;
+  height: 100%;
+  background: linear-gradient(to right, rgba(0, 0, 0, 0.1), transparent);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Right shadow when not fully scrolled */
+.table-scroll-container.has-scroll::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 20px;
+  height: 100%;
+  background: linear-gradient(to left, rgba(0, 0, 0, 0.1), transparent);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Mobile responsive adjustments */
+@media (max-width: 768px) {
+  .table-scroll-container {
+    margin-left: -1rem;
+    margin-right: -1rem;
+    padding-left: 1rem;
+    padding-right: 1rem;
+    width: calc(100% + 2rem);
+  }
+}
