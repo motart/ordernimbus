@@ -1264,6 +1264,164 @@ exports.handler = async (event) => {
         };
         break;
         
+      case 'preferences':
+        // Handle user preferences (column visibility, display settings, etc.)
+        const prefsAuthHeader = event.headers?.Authorization || event.headers?.authorization;
+        let prefsUserId = await extractUserIdFromToken(prefsAuthHeader);
+        
+        // Fallback to header if JWT extraction fails
+        if (!prefsUserId) {
+          prefsUserId = event.headers?.userid || event.headers?.userId || event.headers?.UserId;
+        }
+        
+        if (!prefsUserId) {
+          return {
+            statusCode: 401,
+            headers: corsHeaders,
+            body: JSON.stringify({ error: 'Authentication required' })
+          };
+        }
+        
+        if (method === 'GET') {
+          // Retrieve user preferences
+          console.log('Getting preferences for user:', prefsUserId);
+          
+          try {
+            const result = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES'
+              }
+            }).promise();
+            
+            responseData = {
+              preferences: result.Item?.preferences || {
+                columnVisibility: {},
+                displaySettings: {},
+                notifications: {},
+                theme: 'light'
+              }
+            };
+          } catch (error) {
+            console.error('Error getting preferences:', error);
+            responseData = {
+              preferences: {
+                columnVisibility: {},
+                displaySettings: {},
+                notifications: {},
+                theme: 'light'
+              }
+            };
+          }
+        } else if (method === 'PUT' || method === 'POST') {
+          // Update user preferences
+          console.log('Updating preferences for user:', prefsUserId);
+          
+          try {
+            const requestBody = JSON.parse(event.body || '{}');
+            const { preferences } = requestBody;
+            
+            if (!preferences) {
+              responseData = {
+                error: 'Preferences object required'
+              };
+              statusCode = 400;
+              break;
+            }
+            
+            // Store preferences with timestamp
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES',
+                preferences: preferences,
+                updatedAt: new Date().toISOString(),
+                userId: prefsUserId
+              }
+            }).promise();
+            
+            responseData = {
+              success: true,
+              message: 'Preferences updated successfully',
+              preferences: preferences
+            };
+          } catch (error) {
+            console.error('Error updating preferences:', error);
+            responseData = {
+              error: 'Failed to update preferences'
+            };
+            statusCode = 500;
+          }
+        } else if (method === 'PATCH') {
+          // Partial update of preferences (merge with existing)
+          console.log('Partially updating preferences for user:', prefsUserId);
+          
+          try {
+            const requestBody = JSON.parse(event.body || '{}');
+            const updates = requestBody.preferences || requestBody;
+            
+            // Get existing preferences
+            const existing = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES'
+              }
+            }).promise();
+            
+            // Merge preferences
+            const mergedPreferences = {
+              ...(existing.Item?.preferences || {}),
+              ...updates,
+              // Deep merge for nested objects
+              columnVisibility: {
+                ...(existing.Item?.preferences?.columnVisibility || {}),
+                ...(updates.columnVisibility || {})
+              },
+              displaySettings: {
+                ...(existing.Item?.preferences?.displaySettings || {}),
+                ...(updates.displaySettings || {})
+              },
+              notifications: {
+                ...(existing.Item?.preferences?.notifications || {}),
+                ...(updates.notifications || {})
+              }
+            };
+            
+            // Store merged preferences
+            await dynamodb.put({
+              TableName: process.env.TABLE_NAME,
+              Item: {
+                pk: `USER#${prefsUserId}`,
+                sk: 'PREFERENCES',
+                preferences: mergedPreferences,
+                updatedAt: new Date().toISOString(),
+                userId: prefsUserId
+              }
+            }).promise();
+            
+            responseData = {
+              success: true,
+              message: 'Preferences updated successfully',
+              preferences: mergedPreferences
+            };
+          } catch (error) {
+            console.error('Error updating preferences:', error);
+            responseData = {
+              error: 'Failed to update preferences'
+            };
+            statusCode = 500;
+          }
+        } else {
+          responseData = {
+            error: `Method ${method} not allowed for preferences`
+          };
+          statusCode = 405;
+        }
+        break;
+        
       case 'stores':
         // Extract userId from JWT token
         const storesAuthHeader = event.headers?.Authorization || event.headers?.authorization;

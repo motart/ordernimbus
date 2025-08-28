@@ -8,7 +8,7 @@ import StoresPage from './StoresPage';
 import ProfilePage from './ProfilePage';
 import ForecastPage from './ForecastPage';
 import InventoryPage from './InventoryPage';
-import OrderPage from './OrderPage';
+import OrderPageEnhanced from './OrderPageEnhanced';
 import ProductsPage from './ProductsPage';
 import CustomersPage from './CustomersPage';
 import NotificationsPage from './NotificationsPage';
@@ -158,7 +158,7 @@ const Dashboard: React.FC = () => {
         ) : activePage === 'inventory' ? (
           <InventoryPage />
         ) : activePage === 'orders' ? (
-          <OrderPage />
+          <OrderPageEnhanced />
         ) : activePage === 'products' ? (
           <ProductsPage />
         ) : activePage === 'customers' ? (
