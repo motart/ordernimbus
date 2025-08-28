@@ -4,8 +4,8 @@ AI-powered sales forecasting platform for brick-and-mortar retailers and Shopify
 
 ## 🌐 Production URLs
 - **Application**: https://app.ordernimbus.com
-- **API**: https://api.ordernimbus.com
-- **Shopify OAuth Callback**: https://tsip547ao2.execute-api.us-west-1.amazonaws.com/production/api/shopify/callback
+- **API**: https://p12brily0d.execute-api.us-west-1.amazonaws.com/production
+- **Shopify OAuth Callback**: https://p12brily0d.execute-api.us-west-1.amazonaws.com/production/api/shopify/callback
 
 ## 🚀 Quick Start
 
