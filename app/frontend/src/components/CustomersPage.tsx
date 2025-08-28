@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import './CustomersPage.css';
+import '../styles/table-scroll.css';
 import toast from 'react-hot-toast';
 import { ClipLoader } from 'react-spinners';
 import { FiRefreshCw, FiSearch, FiFilter, FiUsers, FiPlus, FiMail, FiPhone, FiMapPin } from 'react-icons/fi';
@@ -57,6 +58,7 @@ interface Customer {
 const CustomersPage: React.FC = () => {
   const { getAccessToken } = useAuth();
   const authenticatedFetch = createAuthenticatedFetch({ getAccessToken });
+  const tableScrollRef = useRef<HTMLDivElement>(null);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [countryFilter, setCountryFilter] = useState<string>('all');
@@ -82,6 +84,51 @@ const CustomersPage: React.FC = () => {
   useEffect(() => {
     loadCustomers();
   }, []);
+
+  // Handle horizontal scroll shadow indicators
+  useEffect(() => {
+    const handleScroll = () => {
+      if (!tableScrollRef.current) return;
+      
+      const element = tableScrollRef.current;
+      const isScrollable = element.scrollWidth > element.clientWidth;
+      const scrolledRight = element.scrollLeft > 0;
+      const fullyScrolled = element.scrollLeft + element.clientWidth >= element.scrollWidth - 1;
+      
+      // Add/remove classes for shadow indicators
+      if (isScrollable) {
+        element.classList.add('has-scroll');
+      } else {
+        element.classList.remove('has-scroll');
+      }
+      
+      if (scrolledRight) {
+        element.classList.add('scrolled-right');
+      } else {
+        element.classList.remove('scrolled-right');
+      }
+      
+      if (fullyScrolled) {
+        element.classList.remove('has-scroll');
+      }
+    };
+
+    const scrollContainer = tableScrollRef.current;
+    if (scrollContainer) {
+      scrollContainer.addEventListener('scroll', handleScroll);
+      // Check initial state
+      handleScroll();
+      
+      // Re-check when window resizes
+      const resizeObserver = new ResizeObserver(handleScroll);
+      resizeObserver.observe(scrollContainer);
+      
+      return () => {
+        scrollContainer.removeEventListener('scroll', handleScroll);
+        resizeObserver.disconnect();
+      };
+    }
+  }, [customers.length, searchTerm, countryFilter, visibleColumns]); // Re-check when data or columns change
 
   const loadCustomers = async () => {
     setIsLoading(true);
@@ -455,24 +502,28 @@ const CustomersPage: React.FC = () => {
             </button>
           </div>
         ) : (
-          <div className="customers-table">
-            <div className="table-header">
-              {getVisibleColumnDefinitions().map(col => (
-                <div key={col.key} className="header-cell" title={col.description}>
-                  {col.label}
-                </div>
-              ))}
-            </div>
-            <div className="table-body">
-              {filteredCustomers.map((customer) => (
-                <div key={customer.id} className="table-row">
+          <div className="table-scroll-container" ref={tableScrollRef}>
+            <div className="table-wrapper">
+              <div className="customers-table">
+                <div className="table-header">
                   {getVisibleColumnDefinitions().map(col => (
-                    <div key={col.key} className={`cell ${col.key}-cell`}>
-                      {getCellValue(customer, col.key)}
+                    <div key={col.key} className="header-cell" title={col.description}>
+                      {col.label}
                     </div>
                   ))}
                 </div>
-              ))}
+                <div className="table-body">
+                  {filteredCustomers.map((customer) => (
+                    <div key={customer.id} className="table-row">
+                      {getVisibleColumnDefinitions().map(col => (
+                        <div key={col.key} className={`cell ${col.key}-cell`}>
+                          {getCellValue(customer, col.key)}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
         )}

@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import './InventoryPage.css';
+import '../styles/table-scroll.css';
 import toast from 'react-hot-toast';
 import { ClipLoader } from 'react-spinners';
 import { FiRefreshCw, FiSearch, FiFilter, FiPackage, FiAlertTriangle, FiCheckCircle, FiPlus } from 'react-icons/fi';
@@ -74,6 +75,7 @@ interface Store {
 const InventoryPage: React.FC = () => {
   const { getAccessToken } = useAuth();
   const authenticatedFetch = createAuthenticatedFetch({ getAccessToken });
+  const tableScrollRef = useRef<HTMLDivElement>(null);
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [stores, setStores] = useState<Store[]>([]);
   const [selectedStore, setSelectedStore] = useState<string>('');
@@ -107,6 +109,51 @@ const InventoryPage: React.FC = () => {
       loadInventory();
     }
   }, [selectedStore]);
+
+  // Handle horizontal scroll shadow indicators
+  useEffect(() => {
+    const handleScroll = () => {
+      if (!tableScrollRef.current) return;
+      
+      const element = tableScrollRef.current;
+      const isScrollable = element.scrollWidth > element.clientWidth;
+      const scrolledRight = element.scrollLeft > 0;
+      const fullyScrolled = element.scrollLeft + element.clientWidth >= element.scrollWidth - 1;
+      
+      // Add/remove classes for shadow indicators
+      if (isScrollable) {
+        element.classList.add('has-scroll');
+      } else {
+        element.classList.remove('has-scroll');
+      }
+      
+      if (scrolledRight) {
+        element.classList.add('scrolled-right');
+      } else {
+        element.classList.remove('scrolled-right');
+      }
+      
+      if (fullyScrolled) {
+        element.classList.remove('has-scroll');
+      }
+    };
+
+    const scrollContainer = tableScrollRef.current;
+    if (scrollContainer) {
+      scrollContainer.addEventListener('scroll', handleScroll);
+      // Check initial state
+      handleScroll();
+      
+      // Re-check when window resizes
+      const resizeObserver = new ResizeObserver(handleScroll);
+      resizeObserver.observe(scrollContainer);
+      
+      return () => {
+        scrollContainer.removeEventListener('scroll', handleScroll);
+        resizeObserver.disconnect();
+      };
+    }
+  }, [inventory.length, searchTerm, stockFilter, visibleColumns]); // Re-check when data or columns change
 
   const loadStores = async () => {
     try {
@@ -570,24 +617,28 @@ const InventoryPage: React.FC = () => {
             </button>
           </div>
         ) : (
-          <div className="inventory-table">
-            <div className="table-header">
-              {getVisibleColumnDefinitions().map(col => (
-                <div key={col.key} className="header-cell" title={col.description}>
-                  {col.label}
-                </div>
-              ))}
-            </div>
-            <div className="table-body">
-              {filteredInventory.map((item) => (
-                <div key={item.id} className="table-row">
+          <div className="table-scroll-container" ref={tableScrollRef}>
+            <div className="table-wrapper">
+              <div className="inventory-table">
+                <div className="table-header">
                   {getVisibleColumnDefinitions().map(col => (
-                    <div key={col.key} className={`cell ${col.key}-cell`}>
-                      {getCellValue(item, col.key)}
+                    <div key={col.key} className="header-cell" title={col.description}>
+                      {col.label}
                     </div>
                   ))}
                 </div>
-              ))}
+                <div className="table-body">
+                  {filteredInventory.map((item) => (
+                    <div key={item.id} className="table-row">
+                      {getVisibleColumnDefinitions().map(col => (
+                        <div key={col.key} className={`cell ${col.key}-cell`}>
+                          {getCellValue(item, col.key)}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
         )}
