@@ -126,15 +126,21 @@ const OrderPage: React.FC = () => {
 
   useEffect(() => {
     loadStores();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    // Only load orders if we have stores loaded (or if loading a specific store)
     if (selectedStore === 'all') {
-      loadAllOrders();
-    } else {
+      // Only load all orders if stores are loaded
+      if (stores.length > 0) {
+        loadAllOrders();
+      }
+    } else if (selectedStore) {
       loadOrders();
     }
-  }, [selectedStore]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStore, stores]);
 
   // Handle horizontal scroll shadow indicators
   useEffect(() => {
@@ -246,6 +252,13 @@ const OrderPage: React.FC = () => {
   };
 
   const loadAllOrders = async () => {
+    // Don't try to load if no stores available
+    if (!stores || stores.length === 0) {
+      setIsLoading(false);
+      setOrders([]);
+      return;
+    }
+
     setIsLoading(true);
     try {
       const allOrders: Order[] = [];
