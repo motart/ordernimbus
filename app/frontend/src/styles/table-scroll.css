@@ -40,16 +40,31 @@
   scrollbar-color: #888 #f1f1f1;
 }
 
-/* Ensure grid tables don't wrap */
+/* Ensure grid tables don't wrap and expand naturally */
 .table-header,
 .table-row {
   white-space: nowrap;
   min-width: max-content;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 1rem;
 }
 
 /* Prevent text wrapping in cells */
-.table-cell {
-  white-space: nowrap;
+.table-cell,
+.header-cell,
+.cell {
+  white-space: nowrap !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: max-content;
+}
+
+/* Force grid cells to not wrap */
+.table-header > *,
+.table-row > * {
+  white-space: nowrap !important;
   overflow: hidden;
   text-overflow: ellipsis;
 }
