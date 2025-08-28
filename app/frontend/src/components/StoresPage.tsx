@@ -112,7 +112,7 @@ const StoresPage: React.FC = () => {
     error: secureDataError, 
     setData, 
     getData,
-    clearData 
+    removeData 
   } = useSecureData();
   const { user, getAccessToken } = useAuth();
 
@@ -525,7 +525,7 @@ const StoresPage: React.FC = () => {
         // Clear any additional cache if indicated by backend
         if (result.clearCache && result.cacheKey) {
           try {
-            await clearData(result.cacheKey);
+            await removeData(result.cacheKey);
           } catch (e) {
             console.log('Could not clear cache:', e);
           }
