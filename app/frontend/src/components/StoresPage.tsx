@@ -111,7 +111,8 @@ const StoresPage: React.FC = () => {
     isInitialized, 
     error: secureDataError, 
     setData, 
-    getData 
+    getData,
+    removeData 
   } = useSecureData();
   const { user, getAccessToken } = useAuth();
 
@@ -512,16 +513,39 @@ const StoresPage: React.FC = () => {
       });
 
       if (response.ok) {
+        const result = await response.json();
+        
+        // Remove the deleted store from local state
         const updatedStores = stores.filter(store => store.id !== storeToDelete.id);
         setStores(updatedStores);
+        
+        // Update local cache
         await setData('stores', updatedStores);
-        toast.success(`${storeToDelete.name} has been deleted`);
+        
+        // Clear any additional cache if indicated by backend
+        if (result.clearCache && result.cacheKey) {
+          try {
+            await removeData(result.cacheKey);
+          } catch (e) {
+            console.log('Could not clear cache:', e);
+          }
+        }
+        
+        toast.success(`${storeToDelete.name} has been deleted successfully`);
+        
+        // Optionally reload stores to ensure consistency
+        // This ensures we're in sync with the backend
+        setTimeout(() => {
+          loadStores();
+        }, 500);
       } else {
-        throw new Error('Failed to delete store');
+        const errorData = await response.json().catch(() => ({}));
+        const errorMessage = errorData.error || 'Failed to delete store';
+        throw new Error(errorMessage);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to delete store:', error);
-      toast.error('Failed to delete store');
+      toast.error(error.message || 'Failed to delete store');
     } finally {
       setIsDeleting(false);
       setShowDeleteModal(false);
@@ -816,6 +840,7 @@ const StoresPage: React.FC = () => {
                   className="btn-icon delete" 
                   onClick={() => handleDeleteClick(store)}
                   title="Delete store"
+                  data-testid={`delete-${store.id}`}
                 >
                   {React.createElement(FiTrash2 as any)}
                 </button>

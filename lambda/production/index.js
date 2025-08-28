@@ -1444,18 +1444,109 @@ exports.handler = async (event) => {
         }
         // Handle DELETE method with confirmation
         else if (method === 'DELETE') {
-          // Check if this is a request for deletion code or actual deletion
+          // Extract store ID from path
           const pathStr = path || event.rawPath || '';
-          const isRequestingCode = pathStr.includes('/request-deletion');
           const storeId = pathParts[2] || event.pathParameters?.id || event.queryStringParameters?.storeId;
           
-          if (!storeId || storeId === 'request-deletion') {
+          if (!storeId) {
             responseData = {
               error: 'Store ID is required for deletion'
             };
             statusCode = 400;
             break;
           }
+          
+          // Simple deletion without confirmation code for better UX
+          // Security is enforced by ensuring the user owns the store
+          console.log('Deleting store:', storeId, 'for user:', storesUserId);
+          
+          try {
+            // First, verify the store exists and belongs to the user
+            const storeCheck = await dynamodb.get({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${storesUserId}`,
+                sk: `STORE#${storeId}_metadata`
+              }
+            }).promise();
+            
+            if (!storeCheck.Item) {
+              // Try old format
+              const oldFormatCheck = await dynamodb.get({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  userId: storesUserId,
+                  id: `store#${storeId}`
+                }
+              }).promise();
+              
+              if (!oldFormatCheck.Item) {
+                responseData = {
+                  error: 'Store not found or you do not have permission to delete it'
+                };
+                statusCode = 404;
+                break;
+              }
+            }
+            
+            // Store found and belongs to user, proceed with deletion
+            const deletedStore = storeCheck.Item || {};
+            
+            // Delete the store metadata
+            await dynamodb.delete({
+              TableName: process.env.TABLE_NAME,
+              Key: {
+                pk: `USER#${storesUserId}`,
+                sk: `STORE#${storeId}_metadata`
+              },
+              ReturnValues: 'ALL_OLD'
+            }).promise();
+            
+            // Also try to delete old format if it exists
+            try {
+              await dynamodb.delete({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  userId: storesUserId,
+                  id: `store#${storeId}`
+                }
+              }).promise();
+            } catch (e) {
+              // Ignore if old format doesn't exist
+            }
+            
+            console.log('Store deleted successfully:', storeId);
+            
+            // Return success response with cache invalidation flag
+            responseData = {
+              success: true,
+              message: `Store "${deletedStore.name || storeId}" has been deleted successfully`,
+              deletedStore: {
+                id: storeId,
+                name: deletedStore.name || deletedStore.storeName,
+                platform: deletedStore.platform || deletedStore.storeType || 'manual'
+                // Don't return sensitive data like access tokens
+              },
+              clearCache: true,
+              cacheKey: `stores_${storesUserId}`
+            };
+            statusCode = 200;
+            
+          } catch (error) {
+            console.error('Error deleting store:', error);
+            responseData = {
+              error: 'Failed to delete store',
+              details: error.message
+            };
+            statusCode = 500;
+          }
+        }
+        // OLD CONFIRMATION CODE FLOW (keeping for reference but not used)
+        else if (false && method === 'DELETE') {
+          // Check if this is a request for deletion code or actual deletion
+          const pathStr = path || event.rawPath || '';
+          const isRequestingCode = pathStr.includes('/request-deletion');
+          const storeId = pathParts[2] || event.pathParameters?.id || event.queryStringParameters?.storeId;
           
           const requestBody = JSON.parse(event.body || '{}');
           
