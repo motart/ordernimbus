@@ -330,8 +330,11 @@ Run nightly load tests with GitHub Actions:
 ### Common Deployment Issues & Fixes
 
 #### 1. Lambda Code Not Found
-**Error**: "No Lambda code found to deploy"
-**Solution**: Deploy script automatically uses cached Lambda from `/tmp/prod-lambda/` if available
+**Error**: "No Lambda code found to deploy" or "S3 Error Code: NoSuchBucket"
+**Solution**: 
+- Deploy script automatically uses cached Lambda from `/tmp/prod-lambda/` if available
+- Create S3 bucket for Lambda code: `aws s3api create-bucket --bucket ordernimbus-lambda-code --region us-west-1 --create-bucket-configuration LocationConstraint=us-west-1`
+- Upload placeholder Lambda code to avoid CloudFormation failures
 
 #### 2. CloudFormation Stack Deletion Fails
 **Error**: "Stack cannot be deleted while resources exist"
@@ -345,9 +348,13 @@ aws s3 rm s3://BUCKET_NAME --recursive
 
 #### 3. Shopify OAuth Redirect Mismatch
 **Error**: "Redirect URI mismatch"
-**Solution**: Lambda now dynamically generates redirect URI using API Gateway context. Update Shopify app with: `https://YOUR_API_GATEWAY_URL/production/api/shopify/callback`
+**Solution**: Lambda now dynamically generates redirect URI using API Gateway context. Update Shopify app with: `https://p12brily0d.execute-api.us-west-1.amazonaws.com/production/api/shopify/callback`
 
-#### 4. CloudFront Distribution Disabled
+#### 4. CloudFront CNAME Conflict
+**Error**: "CNAMEs you provided are already associated with a different resource"
+**Solution**: Deploy with `ENABLE_CLOUDFRONT=false` if distribution EP62VZVVDF7SQ already exists with app.ordernimbus.com
+
+#### 5. CloudFront Distribution Disabled
 **Error**: Site not accessible after teardown/redeploy
 **Solution**: Re-enable distribution:
 ```bash

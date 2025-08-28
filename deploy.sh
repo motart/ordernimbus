@@ -75,7 +75,7 @@ if [ "$ENVIRONMENT" = "production" ]; then
     S3_BUCKET="ordernimbus-production-frontend-${AWS_ACCOUNT_ID}"
     COGNITO_POOL_NAME="ordernimbus-production-users"
     DOMAIN_NAME="app.ordernimbus.com"
-    ENABLE_CLOUDFRONT="true"
+    ENABLE_CLOUDFRONT="${ENABLE_CLOUDFRONT:-true}"
     HOSTED_ZONE_ID="Z03623712FIVU7Z4CJ949"
 elif [ "$ENVIRONMENT" = "staging" ]; then
     S3_BUCKET="ordernimbus-staging-frontend-${AWS_ACCOUNT_ID}"
@@ -192,10 +192,10 @@ if [ "$ENVIRONMENT" = "production" ] && [ "$ENABLE_CLOUDFRONT" = "true" ]; then
         print_status "Checking SSL certificate in us-east-1..."
         CERT_ARN=$(aws acm list-certificates \
             --region us-east-1 \
-            --query "CertificateSummaryList[?DomainName=='app.ordernimbus.com' || DomainName=='*.ordernimbus.com'].CertificateArn" \
-            --output text | head -1)
+            --query "CertificateSummaryList[?DomainName=='app.ordernimbus.com' || DomainName=='*.ordernimbus.com'].CertificateArn | [0]" \
+            --output text)
         
-        if [ -z "$CERT_ARN" ]; then
+        if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
             print_warning "No SSL certificate found for app.ordernimbus.com"
             print_status "CloudFront will be disabled for this deployment"
             ENABLE_CLOUDFRONT="false"
