@@ -29,7 +29,7 @@ export const useColumnVisibility = ({
   const authenticatedFetch = createAuthenticatedFetch({ getAccessToken });
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
-  const saveTimeoutRef = useRef<NodeJS.Timeout>();
+  const saveTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
 
   // Initialize visible columns from backend or defaults
   const [visibleColumns, setVisibleColumns] = useState<string[]>(() => {

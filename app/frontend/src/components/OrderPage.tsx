@@ -1,133 +1,189 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import './OrderPage.css';
 import toast from 'react-hot-toast';
 import { ClipLoader } from 'react-spinners';
-import { FiRefreshCw, FiSearch, FiFilter, FiShoppingBag, FiDollarSign, FiCheckCircle, FiClock, FiX, FiAlertCircle, FiUpload, FiPlus } from 'react-icons/fi';
+import { FiRefreshCw, FiSearch, FiFilter, FiShoppingBag, FiCheckCircle, FiClock, FiX, FiAlertCircle, FiUpload, FiPlus } from 'react-icons/fi';
 import CSVUploadModal from './CSVUploadModal';
 import ManualEntryModal from './ManualEntryModal';
+import ColumnSelector from './ColumnSelector';
+import { useColumnVisibility } from '../hooks/useColumnVisibility';
+import { ORDER_COLUMNS } from '../config/columnDefinitions';
 import './CSVUploadModal.css';
 import './ManualEntryModal.css';
 import { useAuth } from '../contexts/AuthContext';
 import { createAuthenticatedFetch } from '../utils/authenticatedFetch';
 
-interface OrderItem {
-  id: string;
-  product_id: string;
-  title: string;
-  quantity: number;
-  price: string;
-  variant_title?: string;
-  sku?: string;
-}
-
+// Extended Order interface to match all possible fields from Shopify and CSV
 interface Order {
+  // Essential fields
   id: string;
+  orderId?: string;
   storeId: string;
-  name: string;
+  orderNumber?: string;
+  name?: string;
+  customerName?: string;
+  customerEmail?: string;
+  totalPrice: string | number;
+  financialStatus: string;
+  fulfillmentStatus: string | null;
+  orderDate?: string;
+  created_at?: string;
+  
+  // Customer details
+  customerId?: string;
   email?: string;
   phone?: string;
-  total_price: string;
-  currency: string;
-  financial_status: string;
-  fulfillment_status: string | null;
-  created_at: string;
-  updated_at: string;
+  
+  // Order details
+  itemCount?: number;
+  lineItems?: number;
+  subtotal?: string | number;
+  totalTax?: string | number;
+  totalShipping?: string | number;
+  totalDiscount?: string | number;
+  currency?: string;
   tags?: string;
   note?: string;
-  line_items: OrderItem[];
-  shipping_address?: {
-    first_name?: string;
-    last_name?: string;
-    company?: string;
-    address1?: string;
-    city?: string;
-    province?: string;
-    country?: string;
-    zip?: string;
-  };
-  billing_address?: {
-    first_name?: string;
-    last_name?: string;
-    company?: string;
-    address1?: string;
-    city?: string;
-    province?: string;
-    country?: string;
-    zip?: string;
-  };
+  
+  // Billing address
+  billing_first_name?: string;
+  billing_last_name?: string;
+  billing_address1?: string;
+  billing_address2?: string;
+  billing_city?: string;
+  billing_province?: string;
+  billing_zip?: string;
+  billing_country?: string;
+  
+  // Shipping address
+  shipping_first_name?: string;
+  shipping_last_name?: string;
+  shipping_address1?: string;
+  shipping_address2?: string;
+  shipping_city?: string;
+  shipping_province?: string;
+  shipping_zip?: string;
+  shipping_country?: string;
+  shippingMethod?: string;
+  
+  // Line items summary
+  lineitem_name?: string;
+  lineitem_quantity?: number;
+  lineitem_price?: string;
+  lineitem_sku?: string;
+  line_items?: any[];
+  
+  // Timestamps
+  createdAt?: string;
+  updatedAt?: string;
+  updated_at?: string;
+  syncedAt?: string;
+  
+  // System fields
+  storeDomain?: string;
 }
 
 interface Store {
   id: string;
-  name?: string;
-  displayName?: string;
-  type?: string;
-  shopifyDomain?: string;
-  syncStatus?: string;
+  name: string;
+  type: string;
 }
 
 const OrderPage: React.FC = () => {
   const { getAccessToken } = useAuth();
   const authenticatedFetch = createAuthenticatedFetch({ getAccessToken });
+  
   const [orders, setOrders] = useState<Order[]>([]);
   const [stores, setStores] = useState<Store[]>([]);
-  const [selectedStore, setSelectedStore] = useState<string>('');
+  const [selectedStore, setSelectedStore] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'paid' | 'fulfilled' | 'cancelled'>('all');
-  const [storeFilter, setStoreFilter] = useState<string>('all');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [fulfillmentFilter, setFulfillmentFilter] = useState<string>('all');
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [showCSVUpload, setShowCSVUpload] = useState(false);
   const [showManualEntry, setShowManualEntry] = useState(false);
+  const [selectedStoreName, setSelectedStoreName] = useState('');
+
+  // Column visibility management
+  const {
+    visibleColumns,
+    toggleColumn,
+    resetColumns,
+    isLoading: columnsLoading,
+    isSaving: columnsSaving
+  } = useColumnVisibility({
+    columns: ORDER_COLUMNS,
+    storageKey: 'orders-table'
+  });
+
+  // Get only visible column definitions
+  const visibleColumnDefinitions = useMemo(() => {
+    return ORDER_COLUMNS.filter(col => visibleColumns.includes(col.key));
+  }, [visibleColumns]);
 
   useEffect(() => {
     loadStores();
   }, []);
 
   useEffect(() => {
-    if (selectedStore) {
-      loadOrders();
-    } else {
+    if (selectedStore === 'all') {
       loadAllOrders();
+    } else {
+      loadOrders();
     }
   }, [selectedStore]);
 
   const loadStores = async () => {
     try {
-      // userId is now extracted from JWT token on backend
-      
       const response = await authenticatedFetch(`/api/stores`);
 
       if (response.ok) {
         const data = await response.json();
         setStores(data.stores || []);
         
-        // Auto-load all orders initially
-        if (data.stores && data.stores.length > 0 && !selectedStore) {
-          setSelectedStore('');
+        if (data.stores && data.stores.length === 1) {
+          setSelectedStore(data.stores[0].id);
         }
       } else {
-        toast.error('Failed to load stores');
+        const errorData = await response.json();
+        toast.error(errorData.error || 'Failed to load stores');
+        setStores([]);
       }
     } catch (error) {
       console.error('Error loading stores:', error);
       toast.error('Error loading stores');
+      setStores([]);
     }
   };
 
   const loadOrders = async () => {
-    if (!selectedStore) return;
-    
+    if (!selectedStore || selectedStore === 'all') {
+      return;
+    }
+
     setIsLoading(true);
     try {
-      // userId is now extracted from JWT token on backend
-      
       const response = await authenticatedFetch(`/api/orders?storeId=${selectedStore}`);
 
       if (response.ok) {
         const data = await response.json();
-        setOrders(data.orders || []);
+        // Normalize order data to match our extended interface
+        const normalizedOrders = (data.orders || []).map((order: any) => ({
+          ...order,
+          orderNumber: order.orderNumber || order.name || order.id,
+          customerName: order.customerName || order.customer_name || 
+            (order.billing_first_name && order.billing_last_name ? 
+              `${order.billing_first_name} ${order.billing_last_name}` : 
+              order.email || 'Guest'),
+          customerEmail: order.customerEmail || order.email || order.customer_email,
+          totalPrice: order.totalPrice || order.total_price || order.total || 0,
+          financialStatus: order.financialStatus || order.financial_status || order.payment_status || 'pending',
+          fulfillmentStatus: order.fulfillmentStatus || order.fulfillment_status || order.shipping_status || null,
+          orderDate: order.orderDate || order.created_at || order.createdAt,
+          itemCount: order.itemCount || order.lineItems || order.line_items?.length || 0
+        }));
+        setOrders(normalizedOrders);
       } else {
         const errorData = await response.json();
         toast.error(errorData.error || 'Failed to load orders');
@@ -145,19 +201,34 @@ const OrderPage: React.FC = () => {
   const loadAllOrders = async () => {
     setIsLoading(true);
     try {
-      // userId is now extracted from JWT token on backend
+      const allOrders: Order[] = [];
       
-      // Load orders from all stores
-      const response = await authenticatedFetch(`/api/orders`);
-
-      if (response.ok) {
-        const data = await response.json();
-        setOrders(data.orders || []);
-      } else {
-        const errorData = await response.json();
-        toast.error(errorData.error || 'Failed to load orders');
-        setOrders([]);
+      for (const store of stores) {
+        const response = await authenticatedFetch(`/api/orders?storeId=${store.id}`);
+        
+        if (response.ok) {
+          const data = await response.json();
+          const storeOrders = (data.orders || []).map((order: any) => ({
+            ...order,
+            storeId: store.id,
+            storeName: store.name,
+            orderNumber: order.orderNumber || order.name || order.id,
+            customerName: order.customerName || order.customer_name || 
+              (order.billing_first_name && order.billing_last_name ? 
+                `${order.billing_first_name} ${order.billing_last_name}` : 
+                order.email || 'Guest'),
+            customerEmail: order.customerEmail || order.email || order.customer_email,
+            totalPrice: order.totalPrice || order.total_price || order.total || 0,
+            financialStatus: order.financialStatus || order.financial_status || order.payment_status || 'pending',
+            fulfillmentStatus: order.fulfillmentStatus || order.fulfillment_status || order.shipping_status || null,
+            orderDate: order.orderDate || order.created_at || order.createdAt,
+            itemCount: order.itemCount || order.lineItems || order.line_items?.length || 0
+          }));
+          allOrders.push(...storeOrders);
+        }
       }
+      
+      setOrders(allOrders);
     } catch (error) {
       console.error('Error loading all orders:', error);
       toast.error('Error loading orders');
@@ -169,220 +240,207 @@ const OrderPage: React.FC = () => {
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
-    if (selectedStore) {
-      await loadOrders();
-    } else {
+    if (selectedStore === 'all') {
       await loadAllOrders();
+    } else {
+      await loadOrders();
     }
     setIsRefreshing(false);
     toast.success('Orders refreshed');
   };
 
-  const getStatusIcon = (status: string) => {
-    switch (status?.toLowerCase()) {
-      case 'paid': return FiCheckCircle;
-      case 'pending': return FiClock;
-      case 'cancelled': case 'refunded': return FiX;
-      case 'fulfilled': return FiCheckCircle;
-      default: return FiAlertCircle;
+  const handleCSVUploadClick = () => {
+    if (selectedStore === 'all') {
+      toast.error('Please select a specific store to upload orders');
+      return;
     }
-  };
-
-  const getStatusColor = (status: string) => {
-    switch (status?.toLowerCase()) {
-      case 'paid': case 'fulfilled': return '#10b981';
-      case 'pending': case 'partial': return '#f59e0b';
-      case 'cancelled': case 'refunded': return '#ef4444';
-      default: return '#6b7280';
-    }
-  };
-
-  const formatCurrency = (amount: string, currency: string = 'USD') => {
-    const num = parseFloat(amount || '0');
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: currency.toUpperCase()
-    }).format(num);
-  };
-
-  const formatDate = (dateString: string) => {
-    return new Date(dateString).toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  };
-
-  const filteredOrders = orders.filter(order => {
-    // Search filter
-    if (searchTerm) {
-      const searchLower = searchTerm.toLowerCase();
-      const orderStore = stores.find(s => s.id === order.storeId);
-      const storeName = orderStore ? 
-        (orderStore.displayName || orderStore.name || orderStore.shopifyDomain || orderStore.id) : 
-        'Unknown Store';
-      
-      const matchesSearch = 
-        order.name?.toLowerCase().includes(searchLower) ||
-        order.email?.toLowerCase().includes(searchLower) ||
-        order.id?.toLowerCase().includes(searchLower) ||
-        storeName.toLowerCase().includes(searchLower) ||
-        order.line_items?.some(item => 
-          item.title?.toLowerCase().includes(searchLower) ||
-          item.sku?.toLowerCase().includes(searchLower)
-        );
-      
-      if (!matchesSearch) return false;
-    }
-
-    // Store filter (only applies when viewing all stores)
-    if (!selectedStore && storeFilter !== 'all') {
-      if (order.storeId !== storeFilter) return false;
-    }
-
-    // Status filter
-    if (statusFilter !== 'all') {
-      switch (statusFilter) {
-        case 'pending':
-          return order.financial_status?.toLowerCase() === 'pending';
-        case 'paid':
-          return order.financial_status?.toLowerCase() === 'paid';
-        case 'fulfilled':
-          return order.fulfillment_status?.toLowerCase() === 'fulfilled';
-        case 'cancelled':
-          return order.financial_status?.toLowerCase() === 'cancelled' || 
-                 order.financial_status?.toLowerCase() === 'refunded';
-        default:
-          return true;
-      }
-    }
-
-    return true;
-  });
-
-  const orderSummary = {
-    total: orders.length,
-    pending: orders.filter(order => order.financial_status?.toLowerCase() === 'pending').length,
-    paid: orders.filter(order => order.financial_status?.toLowerCase() === 'paid').length,
-    fulfilled: orders.filter(order => order.fulfillment_status?.toLowerCase() === 'fulfilled').length,
-    totalRevenue: orders.reduce((sum, order) => sum + parseFloat(order.total_price || '0'), 0)
-  };
-
-  const selectedStoreObj = stores.find(s => s.id === selectedStore);
-  const selectedStoreName = selectedStoreObj ? 
-    (selectedStoreObj.displayName || selectedStoreObj.name || selectedStoreObj.shopifyDomain || selectedStoreObj.id) : 
-    'Unknown Store';
-
-  const openOrderDetails = (order: Order) => {
-    setSelectedOrder(order);
-  };
-
-  const closeOrderDetails = () => {
-    setSelectedOrder(null);
+    const store = stores.find(s => s.id === selectedStore);
+    setSelectedStoreName(store?.name || '');
+    setShowCSVUpload(true);
   };
 
   const handleCSVUpload = async (csvData: any[], columnMappings: any, dataType: string) => {
     try {
-      // userId is now extracted from JWT token on backend
-      
-      // Use the universal data upload endpoint
-      const response = await authenticatedFetch(`/api/data/upload-csv`, {
+      const response = await authenticatedFetch(`/api/data/upload`, {
         method: 'POST',
         body: JSON.stringify({
-          dataType: dataType,
           storeId: selectedStore,
-          data: csvData,
-          columnMappings: columnMappings
+          dataType: 'orders',
+          records: csvData,
+          mappedColumns: columnMappings
         })
       });
 
       if (response.ok) {
         const result = await response.json();
-        toast.success(result.message || `Successfully uploaded ${csvData.length} records`);
-        // Reload orders to show the new data
+        toast.success(`Successfully imported ${result.results?.successful || csvData.length} orders`);
         await loadOrders();
       } else {
         const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to upload CSV');
+        throw new Error(errorData.error || 'Failed to upload CSV data');
       }
     } catch (error) {
       console.error('Error uploading CSV:', error);
-      throw error; // Re-throw to let the modal handle the error
-    }
-  };
-
-  const handleManualEntry = async (orderData: any) => {
-    try {
-      // userId is now extracted from JWT token on backend
-      
-      // Add required fields for order creation
-      const completeOrderData = {
-        ...orderData,
-        id: `manual-${Date.now()}`, // Generate a temporary ID
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        line_items: [], // Empty line items for now
-        // Set default values for required fields
-        financial_status: orderData.financial_status || 'pending',
-        fulfillment_status: orderData.fulfillment_status || null,
-        currency: orderData.currency || 'USD'
-      };
-
-      const response = await authenticatedFetch(`/api/orders`, {
-        method: 'POST',
-        body: JSON.stringify({
-          storeId: orderData.storeId || selectedStore,
-          order: completeOrderData
-        })
-      });
-
-      if (response.ok) {
-        toast.success('Order created successfully');
-        // Reload orders to show the new data
-        if (selectedStore) {
-          await loadOrders();
-        } else {
-          await loadAllOrders();
-        }
-      } else {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to create order');
-      }
-    } catch (error) {
-      console.error('Error creating order:', error);
-      toast.error(`Failed to create order: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast.error(`Failed to upload CSV: ${error instanceof Error ? error.message : 'Unknown error'}`);
       throw error;
     }
   };
 
+  const formatCurrency = (amount: string | number) => {
+    const num = typeof amount === 'string' ? parseFloat(amount) : amount;
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD'
+    }).format(num || 0);
+  };
+
+  const formatDate = (dateString?: string) => {
+    if (!dateString) return '--';
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    });
+  };
+
+  const getStatusBadge = (status: string) => {
+    const statusMap: Record<string, { className: string; icon: React.ReactElement }> = {
+      'paid': { className: 'paid', icon: React.createElement(FiCheckCircle as any) },
+      'pending': { className: 'pending', icon: React.createElement(FiClock as any) },
+      'refunded': { className: 'refunded', icon: React.createElement(FiX as any) },
+      'failed': { className: 'failed', icon: React.createElement(FiAlertCircle as any) },
+    };
+    
+    const config = statusMap[status] || statusMap['pending'];
+    
+    return (
+      <span className={`status-badge ${config.className}`}>
+        {config.icon}
+        {status}
+      </span>
+    );
+  };
+
+  const getFulfillmentBadge = (status: string | null) => {
+    if (!status) return <span className="fulfillment-badge unfulfilled">Unfulfilled</span>;
+    
+    const className = status === 'fulfilled' ? 'fulfilled' : status === 'partial' ? 'partial' : 'unfulfilled';
+    return <span className={`fulfillment-badge ${className}`}>{status}</span>;
+  };
+
+  // Render table cell based on column key
+  const renderTableCell = (order: Order, columnKey: string) => {
+    const value = order[columnKey as keyof Order];
+    
+    switch (columnKey) {
+      case 'orderNumber':
+      case 'name':
+        return <span className="order-number">{value || order.id}</span>;
+      
+      case 'customerName':
+        return (
+          <div className="customer-info">
+            <div className="customer-name">{value || 'Guest'}</div>
+            {order.customerEmail && <div className="customer-email">{order.customerEmail}</div>}
+          </div>
+        );
+      
+      case 'totalPrice':
+      case 'subtotal':
+      case 'totalTax':
+      case 'totalShipping':
+      case 'totalDiscount':
+        return <span className="price">{formatCurrency(value as string | number)}</span>;
+      
+      case 'financialStatus':
+        return getStatusBadge(value as string);
+      
+      case 'fulfillmentStatus':
+        return getFulfillmentBadge(value as string | null);
+      
+      case 'orderDate':
+      case 'created_at':
+      case 'createdAt':
+      case 'updated_at':
+      case 'updatedAt':
+      case 'syncedAt':
+        return formatDate(value as string);
+      
+      case 'itemCount':
+      case 'lineItems':
+        return <span className="item-count">{value || 0} items</span>;
+      
+      case 'tags':
+        return value ? (
+          <div className="tags">
+            {(value as string).split(',').map((tag, i) => (
+              <span key={i} className="tag">{tag.trim()}</span>
+            ))}
+          </div>
+        ) : '--';
+      
+      default:
+        return <span>{value?.toString() || '--'}</span>;
+    }
+  };
+
+  // Filter orders based on search and filters
+  const filteredOrders = orders.filter(order => {
+    if (searchTerm && !JSON.stringify(order).toLowerCase().includes(searchTerm.toLowerCase())) {
+      return false;
+    }
+    
+    if (statusFilter !== 'all' && order.financialStatus !== statusFilter) {
+      return false;
+    }
+    
+    if (fulfillmentFilter !== 'all') {
+      const fulfillmentStatus = order.fulfillmentStatus || 'unfulfilled';
+      if (fulfillmentFilter !== fulfillmentStatus) {
+        return false;
+      }
+    }
+    
+    return true;
+  });
+
+  const orderStats = {
+    total: filteredOrders.length,
+    totalRevenue: filteredOrders.reduce((sum, order) => {
+      const price = typeof order.totalPrice === 'string' ? parseFloat(order.totalPrice) : order.totalPrice;
+      return sum + (price || 0);
+    }, 0),
+    paid: filteredOrders.filter(o => o.financialStatus === 'paid').length,
+    pending: filteredOrders.filter(o => o.financialStatus === 'pending').length,
+    fulfilled: filteredOrders.filter(o => o.fulfillmentStatus === 'fulfilled').length
+  };
+
   return (
-    <div className="order-page">
-      <header className="order-header">
+    <div className="orders-page">
+      <header className="orders-header">
         <div className="header-content">
+          <div className="header-left">
+            <h1>Order Management</h1>
+            <p>View and manage all your orders across stores</p>
+          </div>
           <div className="header-actions">
-            <button 
-              onClick={() => setShowManualEntry(true)}
-              className="manual-entry-btn"
-            >
+            <ColumnSelector
+              columns={ORDER_COLUMNS}
+              visibleColumns={visibleColumns}
+              onColumnToggle={toggleColumn}
+              onReset={resetColumns}
+              storageKey="orders-table"
+              position="right"
+            />
+            <button onClick={handleCSVUploadClick} className="csv-upload-btn">
+              {React.createElement(FiUpload as any)}
+              Upload CSV
+            </button>
+            <button onClick={() => setShowManualEntry(true)} className="manual-entry-btn">
               {React.createElement(FiPlus as any)}
               Add Order
             </button>
-            {selectedStore && selectedStoreObj?.type !== 'shopify' && (
-              <button 
-                onClick={() => setShowCSVUpload(true)}
-                className="csv-upload-btn"
-              >
-                {React.createElement(FiUpload as any)}
-                Upload CSV
-              </button>
-            )}
-            <button 
-              onClick={handleRefresh}
-              disabled={isRefreshing}
-              className="refresh-btn"
-            >
+            <button onClick={handleRefresh} disabled={isRefreshing} className="refresh-btn">
               {React.createElement(FiRefreshCw as any, { className: isRefreshing ? 'spinning' : '' })}
               {isRefreshing ? 'Refreshing...' : 'Refresh'}
             </button>
@@ -390,25 +448,15 @@ const OrderPage: React.FC = () => {
         </div>
       </header>
 
-      <div className="order-controls">
+      <div className="orders-controls">
         <div className="controls-row">
-          <div className="store-selector-container">
-            <label>Store:</label>
-            <select 
-              value={selectedStore} 
-              onChange={(e) => setSelectedStore(e.target.value)}
-              className="store-selector"
-            >
-              <option value="">All Stores</option>
-              {stores.map(store => {
-                const storeName = store.displayName || store.name || store.shopifyDomain || store.id;
-                const storeType = store.type || 'shopify';
-                return (
-                  <option key={store.id} value={store.id}>
-                    {storeName} ({storeType})
-                  </option>
-                );
-              })}
+          <div className="store-selector">
+            <select value={selectedStore} onChange={(e) => setSelectedStore(e.target.value)}>
+              {stores.length > 1 && <option value="all">All Stores</option>}
+              {stores.map(store => (
+                <option key={store.id} value={store.id}>{store.name}</option>
+              ))}
+              {stores.length === 0 && <option value="">No stores available</option>}
             </select>
           </div>
 
@@ -416,307 +464,110 @@ const OrderPage: React.FC = () => {
             {React.createElement(FiSearch as any, { className: 'search-icon' })}
             <input
               type="text"
-              placeholder="Search orders, customers, stores..."
+              placeholder="Search orders..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="search-input"
             />
           </div>
 
-          {!selectedStore && (
-            <div className="store-filter-container">
-              <label>Filter by Store:</label>
-              <select
-                value={storeFilter}
-                onChange={(e) => setStoreFilter(e.target.value)}
-                className="store-filter-select"
-              >
-                <option value="all">All Stores</option>
-                {stores.map(store => {
-                  const storeName = store.displayName || store.name || store.shopifyDomain || store.id;
-                  return (
-                    <option key={store.id} value={store.id}>
-                      {storeName}
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
-          )}
-
           <div className="filter-container">
             {React.createElement(FiFilter as any, { className: 'filter-icon' })}
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as any)}
-              className="filter-select"
-            >
-              <option value="all">All Orders</option>
-              <option value="pending">Pending Payment</option>
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="filter-select">
+              <option value="all">All Statuses</option>
               <option value="paid">Paid</option>
+              <option value="pending">Pending</option>
+              <option value="refunded">Refunded</option>
+              <option value="failed">Failed</option>
+            </select>
+          </div>
+
+          <div className="filter-container">
+            <select value={fulfillmentFilter} onChange={(e) => setFulfillmentFilter(e.target.value)} className="filter-select">
+              <option value="all">All Fulfillment</option>
               <option value="fulfilled">Fulfilled</option>
-              <option value="cancelled">Cancelled</option>
+              <option value="unfulfilled">Unfulfilled</option>
+              <option value="partial">Partial</option>
             </select>
           </div>
         </div>
       </div>
 
-      {(selectedStore || orders.length > 0) && (
+      {orders.length > 0 && (
         <div className="order-summary">
-          <div 
-            className={`summary-card ${statusFilter === 'all' ? 'active' : ''}`}
-            onClick={() => setStatusFilter('all')}
-          >
-            <div className="summary-value">{orderSummary.total}</div>
-            <div className="summary-label">Total Orders</div>
+          <div className="summary-card">
+            <div className="summary-icon">{React.createElement(FiShoppingBag as any)}</div>
+            <div>
+              <div className="summary-value">{orderStats.total}</div>
+              <div className="summary-label">Total Orders</div>
+            </div>
           </div>
-          <div 
-            className={`summary-card pending ${statusFilter === 'pending' ? 'active' : ''}`}
-            onClick={() => setStatusFilter('pending')}
-          >
-            <div className="summary-value">{orderSummary.pending}</div>
-            <div className="summary-label">Pending</div>
-          </div>
-          <div 
-            className={`summary-card paid ${statusFilter === 'paid' ? 'active' : ''}`}
-            onClick={() => setStatusFilter('paid')}
-          >
-            <div className="summary-value">{orderSummary.paid}</div>
-            <div className="summary-label">Paid</div>
-          </div>
-          <div 
-            className={`summary-card fulfilled ${statusFilter === 'fulfilled' ? 'active' : ''}`}
-            onClick={() => setStatusFilter('fulfilled')}
-          >
-            <div className="summary-value">{orderSummary.fulfilled}</div>
-            <div className="summary-label">Fulfilled</div>
-          </div>
-          <div className="summary-card revenue">
-            <div className="summary-value">{formatCurrency(orderSummary.totalRevenue.toString())}</div>
+          <div className="summary-card">
+            <div className="summary-value">{formatCurrency(orderStats.totalRevenue)}</div>
             <div className="summary-label">Total Revenue</div>
+          </div>
+          <div className="summary-card">
+            <div className="summary-value">{orderStats.paid}</div>
+            <div className="summary-label">Paid Orders</div>
+          </div>
+          <div className="summary-card">
+            <div className="summary-value">{orderStats.fulfilled}</div>
+            <div className="summary-label">Fulfilled</div>
           </div>
         </div>
       )}
 
-      <div className="order-content">
-        {stores.length === 0 ? (
-          <div className="empty-state">
-            {React.createElement(FiShoppingBag as any, { size: 64, color: '#9ca3af' })}
-            <h3>No Stores Available</h3>
-            <p>You need to connect at least one store to view orders</p>
-          </div>
-        ) : isLoading ? (
+      <div className="orders-content">
+        {isLoading || columnsLoading ? (
           <div className="loading-state">
             <ClipLoader size={40} color="#667eea" />
-            <p>Loading orders {selectedStore ? `for ${selectedStoreName}` : 'from all stores'}...</p>
+            <p>Loading orders...</p>
           </div>
         ) : orders.length === 0 ? (
           <div className="empty-state">
             {React.createElement(FiShoppingBag as any, { size: 64, color: '#9ca3af' })}
             <h3>No Orders Found</h3>
-            <p>No orders found {selectedStore ? `for ${selectedStoreName}` : 'across all stores'}. Orders will appear here once your stores start receiving them.</p>
-            <button onClick={handleRefresh} className="action-button">
-              Refresh Orders
-            </button>
+            <p>No orders in your stores yet or select a store to view its orders.</p>
           </div>
         ) : filteredOrders.length === 0 ? (
           <div className="empty-state">
             {React.createElement(FiSearch as any, { size: 64, color: '#9ca3af' })}
             <h3>No Results Found</h3>
             <p>No orders match your current search and filters.</p>
-            <button onClick={() => { setSearchTerm(''); setStatusFilter('all'); setStoreFilter('all'); }} className="action-button">
+            <button onClick={() => { setSearchTerm(''); setStatusFilter('all'); setFulfillmentFilter('all'); }} className="action-button">
               Clear Filters
             </button>
           </div>
         ) : (
-          <div className="order-table">
-            <div className="table-header">
-              <div className="header-cell">Order</div>
-              <div className="header-cell">Store</div>
-              <div className="header-cell">Customer</div>
-              <div className="header-cell">Amount</div>
-              <div className="header-cell">Payment</div>
-              <div className="header-cell">Fulfillment</div>
-              <div className="header-cell">Date</div>
-              <div className="header-cell">Actions</div>
-            </div>
-            <div className="table-body">
-              {filteredOrders.map((order) => {
-                const PaymentIcon = getStatusIcon(order.financial_status);
-                const FulfillmentIcon = getStatusIcon(order.fulfillment_status || 'unfulfilled');
-                const paymentColor = getStatusColor(order.financial_status);
-                const fulfillmentColor = getStatusColor(order.fulfillment_status || 'unfulfilled');
-
-                const orderStore = stores.find(s => s.id === order.storeId);
-                const orderStoreName = orderStore ? 
-                  (orderStore.displayName || orderStore.name || orderStore.shopifyDomain || orderStore.id) : 
-                  'Unknown Store';
-
-                return (
-                  <div key={order.id} className="table-row">
-                    <div className="cell order-cell">
-                      <div className="order-info">
-                        <div className="order-name">{order.name}</div>
-                        <div className="order-items">
-                          {order.line_items?.length || 0} item{(order.line_items?.length || 0) !== 1 ? 's' : ''}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="cell store-cell">
-                      <div className="store-info">
-                        <div className="store-name">{orderStoreName}</div>
-                        <div className="store-type">{orderStore?.type || 'shopify'}</div>
-                      </div>
-                    </div>
-                    <div className="cell customer-cell">
-                      {order.email ? (
-                        <div className="customer-info">
-                          <div className="customer-email">{order.email}</div>
-                          {order.shipping_address && (
-                            <div className="customer-location">
-                              {order.shipping_address.city}, {order.shipping_address.province}
-                            </div>
-                          )}
-                        </div>
-                      ) : (
-                        <span className="no-customer">--</span>
-                      )}
-                    </div>
-                    <div className="cell amount-cell">
-                      {formatCurrency(order.total_price, order.currency)}
-                    </div>
-                    <div className="cell status-cell">
-                      <div className="status-badge" style={{ color: paymentColor }}>
-                        {React.createElement(PaymentIcon as any, { size: 16 })}
-                        <span>{order.financial_status?.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unknown'}</span>
-                      </div>
-                    </div>
-                    <div className="cell status-cell">
-                      <div className="status-badge" style={{ color: fulfillmentColor }}>
-                        {React.createElement(FulfillmentIcon as any, { size: 16 })}
-                        <span>{order.fulfillment_status?.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unfulfilled'}</span>
-                      </div>
-                    </div>
-                    <div className="cell">
-                      {formatDate(order.created_at)}
-                    </div>
-                    <div className="cell">
-                      <button 
-                        onClick={() => openOrderDetails(order)}
-                        className="view-button"
-                      >
-                        View
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+          <div className="orders-table-wrapper">
+            <table className="orders-table">
+              <thead>
+                <tr>
+                  {visibleColumnDefinitions.map(column => (
+                    <th key={column.key}>{column.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredOrders.map((order) => (
+                  <tr key={order.id}>
+                    {visibleColumnDefinitions.map(column => (
+                      <td key={column.key}>
+                        {renderTableCell(order, column.key)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {columnsSaving && (
+              <div className="saving-indicator">
+                Saving column preferences...
+              </div>
+            )}
           </div>
         )}
       </div>
-
-      {/* Order Details Modal */}
-      {selectedOrder && (
-        <div className="order-modal-overlay" onClick={closeOrderDetails}>
-          <div className="order-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2>Order {selectedOrder.name}</h2>
-              <button onClick={closeOrderDetails} className="close-button">
-                {React.createElement(FiX as any, { size: 20 })}
-              </button>
-            </div>
-            <div className="modal-content">
-              <div className="order-details-section">
-                <h3>Order Information</h3>
-                <div className="details-grid">
-                  <div className="detail-item">
-                    <label>Order ID:</label>
-                    <span>{selectedOrder.id}</span>
-                  </div>
-                  <div className="detail-item">
-                    <label>Store:</label>
-                    <span className="store-designation">
-                      {(() => {
-                        const orderStore = stores.find(s => s.id === selectedOrder.storeId);
-                        return orderStore ? 
-                          (orderStore.displayName || orderStore.name || orderStore.shopifyDomain || orderStore.id) : 
-                          'Unknown Store';
-                      })()} ({(() => {
-                        const orderStore = stores.find(s => s.id === selectedOrder.storeId);
-                        return orderStore?.type || 'shopify';
-                      })()})
-                    </span>
-                  </div>
-                  <div className="detail-item">
-                    <label>Created:</label>
-                    <span>{formatDate(selectedOrder.created_at)}</span>
-                  </div>
-                  <div className="detail-item">
-                    <label>Payment Status:</label>
-                    <span className="status" style={{ color: getStatusColor(selectedOrder.financial_status) }}>
-                      {selectedOrder.financial_status?.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase())}
-                    </span>
-                  </div>
-                  <div className="detail-item">
-                    <label>Fulfillment:</label>
-                    <span className="status" style={{ color: getStatusColor(selectedOrder.fulfillment_status || 'unfulfilled') }}>
-                      {selectedOrder.fulfillment_status?.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Unfulfilled'}
-                    </span>
-                  </div>
-                  <div className="detail-item">
-                    <label>Total:</label>
-                    <span className="amount">{formatCurrency(selectedOrder.total_price, selectedOrder.currency)}</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="order-details-section">
-                <h3>Customer Information</h3>
-                <div className="details-grid">
-                  <div className="detail-item">
-                    <label>Email:</label>
-                    <span>{selectedOrder.email || '--'}</span>
-                  </div>
-                  <div className="detail-item">
-                    <label>Phone:</label>
-                    <span>{selectedOrder.phone || '--'}</span>
-                  </div>
-                </div>
-                {selectedOrder.shipping_address && (
-                  <div className="address-section">
-                    <h4>Shipping Address</h4>
-                    <div className="address">
-                      <div>{selectedOrder.shipping_address.first_name} {selectedOrder.shipping_address.last_name}</div>
-                      {selectedOrder.shipping_address.company && <div>{selectedOrder.shipping_address.company}</div>}
-                      <div>{selectedOrder.shipping_address.address1}</div>
-                      <div>{selectedOrder.shipping_address.city}, {selectedOrder.shipping_address.province} {selectedOrder.shipping_address.zip}</div>
-                      <div>{selectedOrder.shipping_address.country}</div>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="order-details-section">
-                <h3>Items ({selectedOrder.line_items?.length || 0})</h3>
-                <div className="items-list">
-                  {selectedOrder.line_items?.map((item, index) => (
-                    <div key={index} className="item-row">
-                      <div className="item-info">
-                        <div className="item-title">{item.title}</div>
-                        {item.variant_title && <div className="item-variant">{item.variant_title}</div>}
-                        {item.sku && <div className="item-sku">SKU: {item.sku}</div>}
-                      </div>
-                      <div className="item-quantity">×{item.quantity}</div>
-                      <div className="item-price">{formatCurrency(item.price)}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* CSV Upload Modal */}
       <CSVUploadModal
@@ -731,11 +582,13 @@ const OrderPage: React.FC = () => {
       <ManualEntryModal
         isOpen={showManualEntry}
         onClose={() => setShowManualEntry(false)}
-        onSubmit={handleManualEntry}
+        onSubmit={async (orderData) => {
+          // Handle manual order creation
+          // TODO: Implement manual order creation
+        }}
         title="Add New Order"
         type="order"
         stores={stores}
-        selectedStore={selectedStore}
       />
     </div>
   );

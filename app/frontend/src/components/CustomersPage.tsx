@@ -7,26 +7,51 @@ import ManualEntryModal from './ManualEntryModal';
 import './ManualEntryModal.css';
 import { useAuth } from '../contexts/AuthContext';
 import { createAuthenticatedFetch } from '../utils/authenticatedFetch';
+import ColumnSelector from './ColumnSelector';
+import { useColumnVisibility } from '../hooks/useColumnVisibility';
+import { CUSTOMER_COLUMNS } from '../config/columnDefinitions';
 
 interface Customer {
   id: string;
+  customerId?: string;
   email: string;
-  first_name: string;
-  last_name: string;
+  first_name?: string;
+  firstName?: string;
+  last_name?: string;
+  lastName?: string;
+  fullName?: string;
   phone?: string;
   company?: string;
+  address?: string;
   address1?: string;
   address2?: string;
   city?: string;
   province?: string;
+  state?: string;
   zip?: string;
   country?: string;
+  country_code?: string;
   tags?: string;
   notes?: string;
-  created_at: string;
-  updated_at: string;
+  note?: string;
+  created_at?: string;
+  createdAt?: string;
+  updated_at?: string;
+  updatedAt?: string;
   total_orders?: number;
+  orders_count?: number;
   total_spent?: string;
+  average_order_value?: string;
+  last_order_date?: string;
+  first_order_date?: string;
+  accepts_marketing?: boolean;
+  marketing_opt_in_level?: string;
+  verified_email?: boolean;
+  tax_exempt?: boolean;
+  account_activation_email?: string;
+  syncedAt?: string;
+  storeId?: string;
+  storeDomain?: string;
 }
 
 const CustomersPage: React.FC = () => {
@@ -38,6 +63,21 @@ const CustomersPage: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showManualEntry, setShowManualEntry] = useState(false);
+
+  // Use column visibility hook
+  const {
+    visibleColumns,
+    toggleColumn,
+    resetColumns,
+    getVisibleColumnDefinitions,
+    isLoading: columnsLoading
+  } = useColumnVisibility({
+    columns: CUSTOMER_COLUMNS,
+    storageKey: 'customers-table',
+    defaultVisible: CUSTOMER_COLUMNS
+      .filter(col => col.defaultVisible !== false || col.required)
+      .map(col => col.key)
+  });
 
   useEffect(() => {
     loadCustomers();
@@ -59,7 +99,7 @@ const CustomersPage: React.FC = () => {
         setCustomers([]);
       }
     } catch (error) {
-      console.error('Error loading customers:', error);
+      // TODO: Log error to monitoring service
       toast.error('Error loading customers');
       setCustomers([]);
     } finally {
@@ -101,13 +141,13 @@ const CustomersPage: React.FC = () => {
         throw new Error(errorData.error || 'Failed to create customer');
       }
     } catch (error) {
-      console.error('Error creating customer:', error);
+      // TODO: Log error to monitoring service
       toast.error(`Failed to create customer: ${error instanceof Error ? error.message : 'Unknown error'}`);
       throw error;
     }
   };
 
-  const formatCurrency = (amount: string | number) => {
+  const formatCurrency = (amount: string | number | undefined) => {
     const num = parseFloat(amount?.toString() || '0');
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
@@ -115,7 +155,8 @@ const CustomersPage: React.FC = () => {
     }).format(num);
   };
 
-  const formatDate = (dateString: string) => {
+  const formatDate = (dateString: string | undefined) => {
+    if (!dateString) return '--';
     return new Date(dateString).toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
@@ -123,12 +164,23 @@ const CustomersPage: React.FC = () => {
     });
   };
 
+  const formatBoolean = (value: boolean | undefined) => {
+    if (value === undefined) return '--';
+    return value ? 'Yes' : 'No';
+  };
+
   const getCustomerName = (customer: Customer) => {
-    return `${customer.first_name} ${customer.last_name}`.trim();
+    if (customer.fullName) return customer.fullName;
+    const firstName = customer.firstName || customer.first_name || '';
+    const lastName = customer.lastName || customer.last_name || '';
+    return `${firstName} ${lastName}`.trim() || '--';
   };
 
   const getCustomerLocation = (customer: Customer) => {
-    const parts = [customer.city, customer.province, customer.country].filter(Boolean);
+    const city = customer.city;
+    const state = customer.state || customer.province;
+    const country = customer.country;
+    const parts = [city, state, country].filter(Boolean);
     return parts.join(', ') || '--';
   };
 
@@ -166,6 +218,141 @@ const CustomersPage: React.FC = () => {
       : 0
   };
 
+  // Helper function to get cell value based on column key
+  const getCellValue = (customer: Customer, columnKey: string) => {
+    switch (columnKey) {
+      case 'fullName':
+        return (
+          <div className="customer-info">
+            <div className="customer-name">{getCustomerName(customer)}</div>
+            {customer.company && visibleColumns.includes('company') && (
+              <div className="customer-company">{customer.company}</div>
+            )}
+            {customer.tags && visibleColumns.includes('tags') && (
+              <div className="customer-tags">
+                {customer.tags.split(',').map((tag, index) => (
+                  <span key={index} className="tag">{tag.trim()}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      
+      case 'email':
+        return (
+          <div className="contact-info">
+            <div className="contact-item">
+              {React.createElement(FiMail as any, { size: 14 })}
+              <span>{customer.email}</span>
+            </div>
+          </div>
+        );
+      
+      case 'phone':
+        return customer.phone ? (
+          <div className="contact-item">
+            {React.createElement(FiPhone as any, { size: 14 })}
+            <span>{customer.phone}</span>
+          </div>
+        ) : '--';
+      
+      case 'total_orders':
+        return <span className="orders-count">{customer.total_orders || customer.orders_count || 0}</span>;
+      
+      case 'total_spent':
+        return <span className="spent-amount">{formatCurrency(customer.total_spent || '0')}</span>;
+      
+      case 'firstName':
+        return customer.firstName || customer.first_name || '--';
+      
+      case 'lastName':
+        return customer.lastName || customer.last_name || '--';
+      
+      case 'company':
+        return customer.company || '--';
+      
+      case 'customerId':
+        return customer.customerId || customer.id || '--';
+      
+      case 'address':
+        return customer.address || '--';
+      
+      case 'address1':
+        return customer.address1 || '--';
+      
+      case 'address2':
+        return customer.address2 || '--';
+      
+      case 'city':
+        return customer.city || '--';
+      
+      case 'state':
+      case 'province':
+        return customer.state || customer.province || '--';
+      
+      case 'zip':
+        return customer.zip || '--';
+      
+      case 'country':
+        return customer.country || '--';
+      
+      case 'country_code':
+        return customer.country_code || '--';
+      
+      case 'tags':
+        return customer.tags || '--';
+      
+      case 'note':
+      case 'notes':
+        return customer.note || customer.notes || '--';
+      
+      case 'orders_count':
+        return customer.orders_count || customer.total_orders || 0;
+      
+      case 'average_order_value':
+        return formatCurrency(customer.average_order_value);
+      
+      case 'last_order_date':
+        return formatDate(customer.last_order_date);
+      
+      case 'first_order_date':
+        return formatDate(customer.first_order_date);
+      
+      case 'accepts_marketing':
+        return formatBoolean(customer.accepts_marketing);
+      
+      case 'marketing_opt_in_level':
+        return customer.marketing_opt_in_level || '--';
+      
+      case 'verified_email':
+        return formatBoolean(customer.verified_email);
+      
+      case 'tax_exempt':
+        return formatBoolean(customer.tax_exempt);
+      
+      case 'account_activation_email':
+        return customer.account_activation_email || '--';
+      
+      case 'createdAt':
+        return formatDate(customer.createdAt || customer.created_at);
+      
+      case 'updatedAt':
+        return formatDate(customer.updatedAt || customer.updated_at);
+      
+      case 'syncedAt':
+        return formatDate(customer.syncedAt);
+      
+      case 'storeId':
+        return customer.storeId || '--';
+      
+      case 'storeDomain':
+        return customer.storeDomain || '--';
+      
+      default:
+        return '--';
+    }
+  };
+
   return (
     <div className="customers-page">
       <header className="customers-header">
@@ -178,6 +365,13 @@ const CustomersPage: React.FC = () => {
               {React.createElement(FiPlus as any)}
               Add Customer
             </button>
+            <ColumnSelector
+              columns={CUSTOMER_COLUMNS}
+              visibleColumns={visibleColumns}
+              onColumnToggle={toggleColumn}
+              onReset={resetColumns}
+              storageKey="customers-table"
+            />
             <button 
               onClick={handleRefresh}
               disabled={isRefreshing}
@@ -237,7 +431,7 @@ const CustomersPage: React.FC = () => {
       )}
 
       <div className="customers-content">
-        {isLoading ? (
+        {isLoading || columnsLoading ? (
           <div className="loading-state">
             <ClipLoader size={40} color="#667eea" />
             <p>Loading customers...</p>
@@ -263,58 +457,20 @@ const CustomersPage: React.FC = () => {
         ) : (
           <div className="customers-table">
             <div className="table-header">
-              <div className="header-cell">Customer</div>
-              <div className="header-cell">Contact</div>
-              <div className="header-cell">Location</div>
-              <div className="header-cell">Orders</div>
-              <div className="header-cell">Total Spent</div>
-              <div className="header-cell">Joined</div>
+              {getVisibleColumnDefinitions().map(col => (
+                <div key={col.key} className="header-cell" title={col.description}>
+                  {col.label}
+                </div>
+              ))}
             </div>
             <div className="table-body">
               {filteredCustomers.map((customer) => (
                 <div key={customer.id} className="table-row">
-                  <div className="cell customer-cell">
-                    <div className="customer-info">
-                      <div className="customer-name">{getCustomerName(customer)}</div>
-                      {customer.company && <div className="customer-company">{customer.company}</div>}
-                      {customer.tags && (
-                        <div className="customer-tags">
-                          {customer.tags.split(',').map((tag, index) => (
-                            <span key={index} className="tag">{tag.trim()}</span>
-                          ))}
-                        </div>
-                      )}
+                  {getVisibleColumnDefinitions().map(col => (
+                    <div key={col.key} className={`cell ${col.key}-cell`}>
+                      {getCellValue(customer, col.key)}
                     </div>
-                  </div>
-                  <div className="cell contact-cell">
-                    <div className="contact-info">
-                      <div className="contact-item">
-                        {React.createElement(FiMail as any, { size: 14 })}
-                        <span>{customer.email}</span>
-                      </div>
-                      {customer.phone && (
-                        <div className="contact-item">
-                          {React.createElement(FiPhone as any, { size: 14 })}
-                          <span>{customer.phone}</span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="cell location-cell">
-                    <div className="location-info">
-                      {React.createElement(FiMapPin as any, { size: 14 })}
-                      <span>{getCustomerLocation(customer)}</span>
-                    </div>
-                  </div>
-                  <div className="cell orders-cell">
-                    <span className="orders-count">{customer.total_orders || 0}</span>
-                  </div>
-                  <div className="cell spent-cell">
-                    <span className="spent-amount">{formatCurrency(customer.total_spent || '0')}</span>
-                  </div>
-                  <div className="cell">
-                    {formatDate(customer.created_at)}
-                  </div>
+                  ))}
                 </div>
               ))}
             </div>

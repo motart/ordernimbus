@@ -7,9 +7,13 @@ import ManualEntryModal from './ManualEntryModal';
 import './ManualEntryModal.css';
 import { useAuth } from '../contexts/AuthContext';
 import { createAuthenticatedFetch } from '../utils/authenticatedFetch';
+import ColumnSelector from './ColumnSelector';
+import { useColumnVisibility } from '../hooks/useColumnVisibility';
+import { PRODUCT_COLUMNS } from '../config/columnDefinitions';
 
 interface Product {
   id: string;
+  productId?: string;
   storeId: string;
   title: string;
   description?: string;
@@ -18,12 +22,34 @@ interface Product {
   price: string;
   sku?: string;
   barcode?: string;
+  inventory?: number; // For display
   inventory_quantity?: number;
+  inventory_policy?: string;
+  inventory_management?: string;
   weight?: number;
+  weight_unit?: string;
   compare_at_price?: string;
+  cost?: string;
+  margin?: string;
   tags?: string;
-  created_at: string;
-  updated_at: string;
+  handle?: string;
+  seo_title?: string;
+  seo_description?: string;
+  image?: string;
+  images?: string;
+  variantId?: string;
+  variantTitle?: string;
+  name?: string;
+  dimensions?: string;
+  requires_shipping?: boolean;
+  taxable?: boolean;
+  createdAt?: string;
+  created_at?: string;
+  updatedAt?: string;
+  updated_at?: string;
+  publishedAt?: string;
+  syncedAt?: string;
+  storeDomain?: string;
 }
 
 interface Store {
@@ -48,6 +74,21 @@ const ProductsPage: React.FC = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showManualEntry, setShowManualEntry] = useState(false);
 
+  // Use column visibility hook
+  const {
+    visibleColumns,
+    toggleColumn,
+    resetColumns,
+    getVisibleColumnDefinitions,
+    isLoading: columnsLoading
+  } = useColumnVisibility({
+    columns: PRODUCT_COLUMNS,
+    storageKey: 'products-table',
+    defaultVisible: PRODUCT_COLUMNS
+      .filter(col => col.defaultVisible !== false || col.required)
+      .map(col => col.key)
+  });
+
   useEffect(() => {
     loadStores();
   }, []);
@@ -60,8 +101,6 @@ const ProductsPage: React.FC = () => {
 
   const loadStores = async () => {
     try {
-      // userId is now extracted from JWT token on backend
-      
       const response = await authenticatedFetch(`/api/stores`);
 
       if (response.ok) {
@@ -76,7 +115,7 @@ const ProductsPage: React.FC = () => {
         toast.error('Failed to load stores');
       }
     } catch (error) {
-      console.error('Error loading stores:', error);
+      // TODO: Log error to monitoring service
       toast.error('Error loading stores');
     }
   };
@@ -86,20 +125,27 @@ const ProductsPage: React.FC = () => {
     
     setIsLoading(true);
     try {
-      // userId is now extracted from JWT token on backend
-      
       const response = await authenticatedFetch(`/api/products?storeId=${selectedStore}`);
 
       if (response.ok) {
         const data = await response.json();
-        setProducts(data.products || []);
+        // Normalize data to include both old and new field names
+        const normalizedProducts = (data.products || []).map((product: any) => ({
+          ...product,
+          // Ensure we have inventory for display
+          inventory: product.inventory || product.inventory_quantity || 0,
+          // Ensure we have proper date fields
+          createdAt: product.createdAt || product.created_at,
+          updatedAt: product.updatedAt || product.updated_at
+        }));
+        setProducts(normalizedProducts);
       } else {
         const errorData = await response.json();
         toast.error(errorData.error || 'Failed to load products');
         setProducts([]);
       }
     } catch (error) {
-      console.error('Error loading products:', error);
+      // TODO: Log error to monitoring service
       toast.error('Error loading products');
       setProducts([]);
     } finally {
@@ -116,8 +162,6 @@ const ProductsPage: React.FC = () => {
 
   const handleManualEntry = async (productData: any) => {
     try {
-      // userId is now extracted from JWT token on backend
-      
       const response = await authenticatedFetch(`/api/products`, {
         method: 'POST',
         body: JSON.stringify({
@@ -143,13 +187,13 @@ const ProductsPage: React.FC = () => {
         throw new Error(errorData.error || 'Failed to create product');
       }
     } catch (error) {
-      console.error('Error creating product:', error);
+      // TODO: Log error to monitoring service
       toast.error(`Failed to create product: ${error instanceof Error ? error.message : 'Unknown error'}`);
       throw error;
     }
   };
 
-  const formatCurrency = (amount: string | number) => {
+  const formatCurrency = (amount: string | number | undefined) => {
     const num = parseFloat(amount?.toString() || '0');
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
@@ -157,12 +201,18 @@ const ProductsPage: React.FC = () => {
     }).format(num);
   };
 
-  const formatDate = (dateString: string) => {
+  const formatDate = (dateString: string | undefined) => {
+    if (!dateString) return '--';
     return new Date(dateString).toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
       day: 'numeric'
     });
+  };
+
+  const formatBoolean = (value: boolean | undefined) => {
+    if (value === undefined) return '--';
+    return value ? 'Yes' : 'No';
   };
 
   // Get unique product types and vendors for filters
@@ -201,6 +251,152 @@ const ProductsPage: React.FC = () => {
     (selectedStoreObj.displayName || selectedStoreObj.name || selectedStoreObj.shopifyDomain || selectedStoreObj.id) : 
     'Unknown Store';
 
+  // Get visible column definitions
+  const visibleColumnDefs = getVisibleColumnDefinitions();
+
+  // Helper function to get cell value based on column key
+  const getCellValue = (product: Product, columnKey: string) => {
+    switch (columnKey) {
+      case 'title':
+        return (
+          <div className="product-info">
+            <div className="product-title">{product.title}</div>
+            {product.sku && visibleColumns.includes('sku') && (
+              <div className="product-sku">SKU: {product.sku}</div>
+            )}
+            {product.tags && visibleColumns.includes('tags') && (
+              <div className="product-tags">
+                {React.createElement(FiTag as any, { size: 12 })}
+                {product.tags}
+              </div>
+            )}
+          </div>
+        );
+      
+      case 'sku':
+        return product.sku || '--';
+      
+      case 'price':
+        return (
+          <div className="price-info">
+            <div className="current-price">{formatCurrency(product.price)}</div>
+            {product.compare_at_price && parseFloat(product.compare_at_price) > parseFloat(product.price) && (
+              <div className="compare-price">{formatCurrency(product.compare_at_price)}</div>
+            )}
+          </div>
+        );
+      
+      case 'inventory':
+        const qty = product.inventory || product.inventory_quantity || 0;
+        return (
+          <span className={`inventory-badge ${qty > 0 ? 'in-stock' : 'out-of-stock'}`}>
+            {qty}
+          </span>
+        );
+      
+      case 'vendor':
+        return product.vendor || '--';
+      
+      case 'product_type':
+        return product.product_type || '--';
+      
+      case 'description':
+        return product.description ? (
+          <div className="description-cell" title={product.description}>
+            {product.description.substring(0, 100)}
+            {product.description.length > 100 && '...'}
+          </div>
+        ) : '--';
+      
+      case 'productId':
+        return product.productId || product.id || '--';
+      
+      case 'variantId':
+        return product.variantId || '--';
+      
+      case 'variantTitle':
+        return product.variantTitle || '--';
+      
+      case 'name':
+        return product.name || '--';
+      
+      case 'tags':
+        return product.tags || '--';
+      
+      case 'barcode':
+        return product.barcode || '--';
+      
+      case 'compare_at_price':
+        return formatCurrency(product.compare_at_price);
+      
+      case 'cost':
+        return formatCurrency(product.cost);
+      
+      case 'margin':
+        return product.margin || '--';
+      
+      case 'weight':
+        return product.weight ? `${product.weight} ${product.weight_unit || 'kg'}` : '--';
+      
+      case 'weight_unit':
+        return product.weight_unit || '--';
+      
+      case 'dimensions':
+        return product.dimensions || '--';
+      
+      case 'inventory_quantity':
+        return product.inventory_quantity || 0;
+      
+      case 'inventory_policy':
+        return product.inventory_policy || '--';
+      
+      case 'inventory_management':
+        return product.inventory_management || '--';
+      
+      case 'requires_shipping':
+        return formatBoolean(product.requires_shipping);
+      
+      case 'taxable':
+        return formatBoolean(product.taxable);
+      
+      case 'image':
+        return product.image ? <img src={product.image} alt={product.title} style={{ width: 50, height: 50 }} /> : '--';
+      
+      case 'images':
+        return product.images || '--';
+      
+      case 'createdAt':
+        return formatDate(product.createdAt || product.created_at);
+      
+      case 'updatedAt':
+        return formatDate(product.updatedAt || product.updated_at);
+      
+      case 'publishedAt':
+        return formatDate(product.publishedAt);
+      
+      case 'syncedAt':
+        return formatDate(product.syncedAt);
+      
+      case 'handle':
+        return product.handle || '--';
+      
+      case 'seo_title':
+        return product.seo_title || '--';
+      
+      case 'seo_description':
+        return product.seo_description || '--';
+      
+      case 'storeId':
+        return product.storeId || '--';
+      
+      case 'storeDomain':
+        return product.storeDomain || selectedStoreObj?.shopifyDomain || '--';
+      
+      default:
+        return '--';
+    }
+  };
+
   return (
     <div className="order-page">
       <header className="order-header">
@@ -215,6 +411,13 @@ const ProductsPage: React.FC = () => {
                 Add Product
               </button>
             )}
+            <ColumnSelector
+              columns={PRODUCT_COLUMNS}
+              visibleColumns={visibleColumns}
+              onColumnToggle={toggleColumn}
+              onReset={resetColumns}
+              storageKey="products-table"
+            />
             <button 
               onClick={handleRefresh}
               disabled={isRefreshing}
@@ -298,20 +501,27 @@ const ProductsPage: React.FC = () => {
           </div>
           <div className="summary-card low-stock">
             <div className="summary-value">
-              {filteredProducts.filter(p => (p.inventory_quantity || 0) < 10 && (p.inventory_quantity || 0) > 0).length}
+              {filteredProducts.filter(p => {
+                const qty = p.inventory || p.inventory_quantity || 0;
+                return qty < 10 && qty > 0;
+              }).length}
             </div>
             <div className="summary-label">Low Stock</div>
           </div>
           <div className="summary-card out-of-stock">
             <div className="summary-value">
-              {filteredProducts.filter(p => (p.inventory_quantity || 0) === 0).length}
+              {filteredProducts.filter(p => (p.inventory || p.inventory_quantity || 0) === 0).length}
             </div>
             <div className="summary-label">Out of Stock</div>
           </div>
           <div className="summary-card revenue">
             <div className="summary-value">
               {formatCurrency(
-                filteredProducts.reduce((sum, p) => sum + (parseFloat(p.price) || 0) * (p.inventory_quantity || 0), 0)
+                filteredProducts.reduce((sum, p) => {
+                  const price = parseFloat(p.price) || 0;
+                  const qty = p.inventory || p.inventory_quantity || 0;
+                  return sum + (price * qty);
+                }, 0)
               )}
             </div>
             <div className="summary-label">Total Value</div>
@@ -326,7 +536,7 @@ const ProductsPage: React.FC = () => {
             <h3>Select a Store</h3>
             <p>Choose a store from the dropdown to view its products</p>
           </div>
-        ) : isLoading ? (
+        ) : isLoading || columnsLoading ? (
           <div className="loading-state">
             <ClipLoader size={40} color="#667eea" />
             <p>Loading products for {selectedStoreName}...</p>
@@ -352,46 +562,20 @@ const ProductsPage: React.FC = () => {
         ) : (
           <div className="order-table">
             <div className="table-header">
-              <div className="header-cell">Product</div>
-              <div className="header-cell">Type</div>
-              <div className="header-cell">Vendor</div>
-              <div className="header-cell">Price</div>
-              <div className="header-cell">Inventory</div>
-              <div className="header-cell">Created</div>
+              {visibleColumnDefs.map(col => (
+                <div key={col.key} className="header-cell" title={col.description}>
+                  {col.label}
+                </div>
+              ))}
             </div>
             <div className="table-body">
               {filteredProducts.map((product) => (
                 <div key={product.id} className="table-row">
-                  <div className="cell product-cell">
-                    <div className="product-info">
-                      <div className="product-title">{product.title}</div>
-                      {product.sku && <div className="product-sku">SKU: {product.sku}</div>}
-                      {product.tags && (
-                        <div className="product-tags">
-                          {React.createElement(FiTag as any, { size: 12 })}
-                          {product.tags}
-                        </div>
-                      )}
+                  {visibleColumnDefs.map(col => (
+                    <div key={col.key} className={`cell ${col.key}-cell`}>
+                      {getCellValue(product, col.key)}
                     </div>
-                  </div>
-                  <div className="cell">{product.product_type || '--'}</div>
-                  <div className="cell">{product.vendor || '--'}</div>
-                  <div className="cell price-cell">
-                    <div className="price-info">
-                      <div className="current-price">{formatCurrency(product.price)}</div>
-                      {product.compare_at_price && parseFloat(product.compare_at_price) > parseFloat(product.price) && (
-                        <div className="compare-price">{formatCurrency(product.compare_at_price)}</div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="cell inventory-cell">
-                    <span className={`inventory-badge ${(product.inventory_quantity || 0) > 0 ? 'in-stock' : 'out-of-stock'}`}>
-                      {product.inventory_quantity || 0}
-                    </span>
-                  </div>
-                  <div className="cell">
-                    {formatDate(product.created_at)}
-                  </div>
+                  ))}
                 </div>
               ))}
             </div>
